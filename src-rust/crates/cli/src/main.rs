@@ -13,7 +13,7 @@ mod oauth_flow;
 use anyhow::Context;
 use cc_core::{
     config::{Config, PermissionMode, Settings},
-    constants::{APP_VERSION, DEFAULT_MODEL},
+    constants::APP_VERSION,
     context::ContextBuilder,
     cost::CostTracker,
     permissions::{AutoPermissionHandler, InteractivePermissionHandler},
@@ -99,9 +99,9 @@ struct Cli {
     #[arg(short = 'p', long = "print", action = ArgAction::SetTrue)]
     print: bool,
 
-    /// Model to use
-    #[arg(short = 'm', long = "model", default_value = DEFAULT_MODEL)]
-    model: String,
+    /// Model to use (overrides settings.json `config.model`)
+    #[arg(short = 'm', long = "model")]
+    model: Option<String>,
 
     /// Permission mode
     #[arg(long = "permission-mode", value_enum, default_value_t = CliPermissionMode::Default)]
@@ -312,7 +312,9 @@ async fn main() -> anyhow::Result<()> {
     if let Some(ref key) = cli.api_key {
         config.api_key = Some(key.clone());
     }
-    config.model = Some(cli.model.clone());
+    if let Some(ref m) = cli.model {
+        config.model = Some(m.clone());
+    }
     if let Some(mt) = cli.max_tokens {
         config.max_tokens = Some(mt);
     }

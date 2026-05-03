@@ -1,0 +1,7 @@
+{
+  "config": {
+    "api_key": "sk-a073dc848f0244cb850d9688b5ae2e69",
+    "api_base": "https://api.deepseek.com/anthropic",
+    "model": "deepseek-v4-flash"
+  }
+}

@@ -1,0 +1,95 @@
+{
+  "header": {
+    "purchase_order_number": "82029096-585",
+    "transaction_type": "850",
+    "purpose_code": "00",
+    "order_type": "RL",
+    "order_date": "2026-04-22",
+    "currency": "USD",
+    "payment_terms": {
+      "type_code": "01",
+      "description": "NET 45"
+    },
+    "shipping_method": "Per Supplier Handbk",
+    "contact": {
+      "name": "HEATHER NICOLE ROBINSON",
+      "function": "Purchasing"
+    }
+  },
+  "parties": {
+    "bill_to": {
+      "name": "ACCOUNTS PAYABLE",
+      "address_1": "PO BOX 94027",
+      "city": "SEATTLE",
+      "state": "WA",
+      "zip": "98124-9427",
+      "country": "US"
+    },
+    "ship_to": {
+      "name": "19287 SAFEWAY NORCAL DIV COMMISSARY",
+      "address_1": "16900 W SCHULTE RD",
+      "city": "TRACY",
+      "state": "CA",
+      "zip": "95377-8985",
+      "country": "US"
+    },
+    "ship_from": {
+      "name": "FGF LLC",
+      "id": "MISSISSAUGA01",
+      "address_1": "C/O CONESTOGA COLD STORAGE",
+      "address_2": "2660 MEADOWPINE BLVD",
+      "city": "MISSISSAUGA",
+      "province": "ONTARIO",
+      "zip": "L5N",
+      "country": "CA"
+    }
+  },
+  "line_items": [
+    {
+      "line_number": "3-1",
+      "quantity": 152,
+      "uom": "CA",
+      "unit_price": 9.83,
+      "item_identifiers": {
+        "sku": "011158027",
+        "gtin": "40762111778664",
+        "internal_id": "82471091"
+      },
+      "description": "SWT.MUFFIN.BLUEBERRY STREUSEL",
+      "delivery_requested_date": "2026-05-01",
+      "inventory_type": "INVENTORY"
+    },
+    {
+      "line_number": "3-2",
+      "quantity": 152,
+      "uom": "CA",
+      "unit_price": 9.83,
+      "item_identifiers": {
+        "sku": "011158027",
+        "gtin": "40762111778664",
+        "internal_id": "82471091"
+      },
+      "description": "SWT.MUFFIN.BLUEBERRY STREUSEL",
+      "delivery_requested_date": "2026-05-01",
+      "inventory_type": "INVENTORY"
+    },
+    {
+      "line_number": "3-3",
+      "quantity": 152,
+      "uom": "CA",
+      "unit_price": 9.83,
+      "item_identifiers": {
+        "sku": "011158027",
+        "gtin": "40762111778664",
+        "internal_id": "82471091"
+      },
+      "description": "SWT.MUFFIN.BLUEBERRY STREUSEL",
+      "delivery_requested_date": "2026-05-01",
+      "inventory_type": "INVENTORY"
+    }
+  ],
+  "summary": {
+    "total_line_items": 3,
+    "control_number": "262100001"
+  }
+}

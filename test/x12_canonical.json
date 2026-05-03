@@ -1,0 +1,438 @@
+{
+  "header": [
+    "00",
+    "",
+    "00",
+    "",
+    "ZZ",
+    "SBUXCP",
+    "ZZ",
+    "FGFTX2600",
+    "260422",
+    "2214",
+    "^",
+    "00501",
+    "126210",
+    "0",
+    "P",
+    ">"
+  ],
+  "options": {
+    "elementDelimiter": "*",
+    "endOfLine": "\n",
+    "format": false,
+    "segmentTerminator": "~",
+    "subElementDelimiter": ">",
+    "repetitionDelimiter": "^",
+    "segmentHeaders": [
+      {
+        "tag": "GS",
+        "trailer": "GE",
+        "layout": {
+          "GS01": 2,
+          "GS02": 15,
+          "GS02_MIN": 2,
+          "GS03": 15,
+          "GS03_MIN": 2,
+          "GS04": 8,
+          "GS05": 8,
+          "GS05_MIN": 4,
+          "GS06": 9,
+          "GS06_MIN": 1,
+          "GS07": 2,
+          "GS07_MIN": 1,
+          "GS08": 12,
+          "GS08_MIN": 1,
+          "COUNT": 8,
+          "PADDING": false
+        }
+      },
+      {
+        "tag": "ISA",
+        "trailer": "IEA",
+        "layout": {
+          "ISA01": 2,
+          "ISA02": 10,
+          "ISA03": 2,
+          "ISA04": 10,
+          "ISA05": 2,
+          "ISA06": 15,
+          "ISA07": 2,
+          "ISA08": 15,
+          "ISA09": 6,
+          "ISA10": 4,
+          "ISA11": 1,
+          "ISA12": 5,
+          "ISA13": 9,
+          "ISA14": 1,
+          "ISA15": 1,
+          "ISA16": 1,
+          "COUNT": 16,
+          "PADDING": true
+        }
+      },
+      {
+        "tag": "ST",
+        "trailer": "SE",
+        "layout": {
+          "ST01": 3,
+          "ST02": 9,
+          "ST02_MIN": 4,
+          "ST03": 35,
+          "ST03_MIN": 1,
+          "COUNT": 3,
+          "COUNT_MIN": 2,
+          "PADDING": false
+        }
+      }
+    ],
+    "txEngine": "internal"
+  },
+  "functionalGroups": [
+    {
+      "header": [
+        "PO",
+        "SBUXCP",
+        "FGFTX2600",
+        "20260422",
+        "2214",
+        "126210",
+        "X",
+        "005010"
+      ],
+      "transactions": [
+        {
+          "header": [
+            "850",
+            "262100001"
+          ],
+          "segments": [
+            {
+              "tag": "BEG",
+              "elements": [
+                "00",
+                "RL",
+                "82029096-585",
+                "",
+                "20260422",
+                "",
+                "",
+                "",
+                "",
+                "",
+                "",
+                "DO"
+              ]
+            },
+            {
+              "tag": "CUR",
+              "elements": [
+                "BY",
+                "USD"
+              ]
+            },
+            {
+              "tag": "REF",
+              "elements": [
+                "IA",
+                "962193"
+              ]
+            },
+            {
+              "tag": "REF",
+              "elements": [
+                "DP",
+                "82"
+              ]
+            },
+            {
+              "tag": "PER",
+              "elements": [
+                "BD",
+                "HEATHER NICOLE ROBINSON"
+              ]
+            },
+            {
+              "tag": "FOB",
+              "elements": [
+                "DF",
+                "ZZ",
+                "FPP"
+              ]
+            },
+            {
+              "tag": "ITD",
+              "elements": [
+                "01",
+                "3",
+                "",
+                "",
+                "",
+                "",
+                "",
+                "",
+                "",
+                "",
+                "",
+                "NET 45"
+              ]
+            },
+            {
+              "tag": "DTM",
+              "elements": [
+                "144",
+                "20260424"
+              ]
+            },
+            {
+              "tag": "TD5",
+              "elements": [
+                "",
+                "ZZ",
+                "Per Supplier Handbk"
+              ]
+            },
+            {
+              "tag": "N9",
+              "elements": [
+                "ZZ",
+                "GENERAL NOTES"
+              ]
+            },
+            {
+              "tag": "MTX",
+              "elements": [
+                "TSD",
+                "Purchase Orders and BPA Releases are subject to Starbucks Standard Terms and Conditions located at http //www.starbucks.com/business/suppliers/standardtermsandconditions. Starbucks offer to purchase Products, Goods, or Services is expressly limited to, and expressly made conditional on, Suppliers/Sellers Acceptance of the terms of Starbucks Standard Terms and Conditions. Starbucks objects to any different or additional terms. (SEVERITY=CRITICAL)"
+              ]
+            },
+            {
+              "tag": "N1",
+              "elements": [
+                "BT",
+                "ACCOUNTS PAYABLE"
+              ]
+            },
+            {
+              "tag": "N3",
+              "elements": [
+                "PO BOX 94027"
+              ]
+            },
+            {
+              "tag": "N4",
+              "elements": [
+                "SEATTLE",
+                "WA",
+                "98124-9427",
+                "US"
+              ]
+            },
+            {
+              "tag": "N1",
+              "elements": [
+                "ST",
+                "19287 SAFEWAY NORCAL DIV COMMISSARY"
+              ]
+            },
+            {
+              "tag": "N3",
+              "elements": [
+                "16900 W SCHULTE RD"
+              ]
+            },
+            {
+              "tag": "N4",
+              "elements": [
+                "TRACY",
+                "CA",
+                "95377-8985",
+                "US"
+              ]
+            },
+            {
+              "tag": "N1",
+              "elements": [
+                "SF",
+                "FGF LLC",
+                "92",
+                "MISSISSAUGA01"
+              ]
+            },
+            {
+              "tag": "N3",
+              "elements": [
+                "C/O CONESTOGA COLD STORAGE",
+                "2660 MEADOWPINE BLVD"
+              ]
+            },
+            {
+              "tag": "N4",
+              "elements": [
+                "MISSISSAUGA",
+                "",
+                "L5N",
+                "CA",
+                "SP",
+                "ONTARIO"
+              ]
+            },
+            {
+              "tag": "PO1",
+              "elements": [
+                "3-1",
+                "152",
+                "CA",
+                "9.83",
+                "UM",
+                "IN",
+                "011158027",
+                "",
+                "",
+                "UK",
+                "40762111778664",
+                "EP",
+                "82471091"
+              ]
+            },
+            {
+              "tag": "PID",
+              "elements": [
+                "F",
+                "GS",
+                "",
+                "",
+                "SWT.MUFFIN.BLUEBERRY STREUSEL"
+              ]
+            },
+            {
+              "tag": "REF",
+              "elements": [
+                "K5",
+                "INVENTORY"
+              ]
+            },
+            {
+              "tag": "REF",
+              "elements": [
+                "CO",
+                "885699"
+              ]
+            },
+            {
+              "tag": "DTM",
+              "elements": [
+                "002",
+                "20260501"
+              ]
+            },
+            {
+              "tag": "PO1",
+              "elements": [
+                "3-2",
+                "152",
+                "CA",
+                "9.83",
+                "UM",
+                "IN",
+                "011158027",
+                "",
+                "",
+                "UK",
+                "40762111778664",
+                "EP",
+                "82471091"
+              ]
+            },
+            {
+              "tag": "PID",
+              "elements": [
+                "F",
+                "GS",
+                "",
+                "",
+                "SWT.MUFFIN.BLUEBERRY STREUSEL"
+              ]
+            },
+            {
+              "tag": "REF",
+              "elements": [
+                "K5",
+                "INVENTORY"
+              ]
+            },
+            {
+              "tag": "REF",
+              "elements": [
+                "CO",
+                "885699"
+              ]
+            },
+            {
+              "tag": "DTM",
+              "elements": [
+                "002",
+                "20260501"
+              ]
+            },
+            {
+              "tag": "PO1",
+              "elements": [
+                "3-3",
+                "152",
+                "CA",
+                "9.83",
+                "UM",
+                "IN",
+                "011158027",
+                "",
+                "",
+                "UK",
+                "40762111778664",
+                "EP",
+                "82471091"
+              ]
+            },
+            {
+              "tag": "PID",
+              "elements": [
+                "F",
+                "GS",
+                "",
+                "",
+                "SWT.MUFFIN.BLUEBERRY STREUSEL"
+              ]
+            },
+            {
+              "tag": "REF",
+              "elements": [
+                "K5",
+                "INVENTORY"
+              ]
+            },
+            {
+              "tag": "REF",
+              "elements": [
+                "CO",
+                "885699"
+              ]
+            },
+            {
+              "tag": "DTM",
+              "elements": [
+                "002",
+                "20260501"
+              ]
+            },
+            {
+              "tag": "CTT",
+              "elements": [
+                "3"
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

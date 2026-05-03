@@ -1,7 +1,18 @@
 {
   "permissions": {
     "allow": [
-      "Bash(pip --version)"
+      "Bash(pip --version)",
+      "Bash(pip install *)",
+      "Bash(python -m litellm --help)",
+      "Bash(where litellm *)",
+      "Bash(python -c \"import sys, sysconfig; print\\('user scripts:', sysconfig.get_path\\('scripts', scheme='nt_user'\\)\\)\")",
+      "PowerShell($scripts = \"C:\\\\Users\\\\jiwon\\\\AppData\\\\Local\\\\Packages\\\\PythonSoftwareFoundation.Python.3.13_qbz5n2kfra8p0\\\\LocalCache\\\\local-packages\\\\Python313\\\\Scripts\"; $current = [Environment]::GetEnvironmentVariable\\(\"Path\", \"User\"\\); if \\($current -split \";\" -contains $scripts\\) { Write-Output \"Already on User PATH\" } else { $new = if \\([string]::IsNullOrEmpty\\($current\\)\\) { $scripts } else { $current.TrimEnd\\(\";\"\\) + \";\" + $scripts }; [Environment]::SetEnvironmentVariable\\(\"Path\", $new, \"User\"\\); Write-Output \"Added to User PATH\" }; Write-Output \"---\"; Write-Output \\([Environment]::GetEnvironmentVariable\\(\"Path\", \"User\"\\)\\))",
+      "Bash(\"C:/Users/jiwon/AppData/Local/Packages/PythonSoftwareFoundation.Python.3.13_qbz5n2kfra8p0/LocalCache/local-packages/Python313/Scripts/litellm.exe\" --version)",
+      "Bash(\"C:/Users/jiwon/AppData/Local/Packages/PythonSoftwareFoundation.Python.3.13_qbz5n2kfra8p0/LocalCache/local-packages/Python313/Scripts/litellm.exe\" --help)",
+      "PowerShell($scripts = \"C:\\\\Users\\\\jiwon\\\\AppData\\\\Local\\\\Packages\\\\PythonSoftwareFoundation.Python.3.13_qbz5n2kfra8p0\\\\LocalCache\\\\local-packages\\\\Python313\\\\Scripts\"; $userPath = [Environment]::GetEnvironmentVariable\\(\"Path\", \"User\"\\); if \\($userPath -split \";\" -contains $scripts\\) { Write-Output \"OK: Scripts dir IS in persistent User PATH\" } else { Write-Output \"MISSING: Scripts dir NOT in persistent User PATH\" })",
+      "PowerShell(\"LIB=$env:LIB\"; \"INCLUDE=$env:INCLUDE\")",
+      "Bash(cargo build *)",
+      "PowerShell(git check-ignore *)"
     ]
   }
 }

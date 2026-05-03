@@ -414,6 +414,8 @@ pub mod config {
     #[derive(Debug, Clone, Serialize, Deserialize, Default)]
     pub struct Config {
         pub api_key: Option<String>,
+        #[serde(default)]
+        pub api_base: Option<String>,
         pub model: Option<String>,
         pub max_tokens: Option<u32>,
         pub permission_mode: PermissionMode,
@@ -632,10 +634,13 @@ pub mod config {
             }
         }
 
-        /// Resolve the API base URL, checking `ANTHROPIC_BASE_URL` first.
+        /// Resolve the API base URL: config field, then `ANTHROPIC_BASE_URL`, then default.
         pub fn resolve_api_base(&self) -> String {
-            std::env::var("ANTHROPIC_BASE_URL")
-                .unwrap_or_else(|_| crate::constants::ANTHROPIC_API_BASE.to_string())
+            self.api_base
+                .clone()
+                .filter(|s| !s.is_empty())
+                .or_else(|| std::env::var("ANTHROPIC_BASE_URL").ok().filter(|s| !s.is_empty()))
+                .unwrap_or_else(|| crate::constants::ANTHROPIC_API_BASE.to_string())
         }
     }
 
@@ -652,15 +657,58 @@ pub mod config {
             Self::config_dir().join("settings.json")
         }
 
+        /// Path to the project-local settings file (`.claude/settings.json`),
+        /// searched starting from the current working directory and walking up
+        /// parent directories — matches how git locates `.git`. Returns `None`
+        /// when no project file exists between cwd and the filesystem root.
+        pub fn project_settings_path() -> Option<PathBuf> {
+            let mut dir = std::env::current_dir().ok()?;
+            loop {
+                let candidate = dir.join(".claude").join("settings.json");
+                if candidate.is_file() {
+                    return Some(candidate);
+                }
+                if !dir.pop() {
+                    return None;
+                }
+            }
+        }
+
+        /// Apply project-level overrides to the loaded global settings.
+        /// Only `config.api_key`, `config.api_base`, and `config.model` are merged —
+        /// keeping the override surface narrow so untyped JSON parsing can't
+        /// accidentally clobber unrelated fields with defaults.
+        fn apply_project_overrides(&mut self, raw: &str) {
+            let Ok(value) = serde_json::from_str::<serde_json::Value>(raw) else { return };
+            let Some(cfg) = value.get("config") else { return };
+            if let Some(s) = cfg.get("api_key").and_then(|v| v.as_str()).filter(|s| !s.is_empty()) {
+                self.config.api_key = Some(s.to_string());
+            }
+            if let Some(s) = cfg.get("api_base").and_then(|v| v.as_str()).filter(|s| !s.is_empty()) {
+                self.config.api_base = Some(s.to_string());
+            }
+            if let Some(s) = cfg.get("model").and_then(|v| v.as_str()).filter(|s| !s.is_empty()) {
+                self.config.model = Some(s.to_string());
+            }
+        }
+
         /// Load settings from disk, returning defaults when the file is missing.
+        /// Project-level settings at `<cwd>/.claude/settings.json` override the
+        /// global file for `api_key` / `api_base` / `model`.
         pub async fn load() -> anyhow::Result<Self> {
             let path = Self::global_settings_path();
-            if path.exists() {
+            let mut settings: Self = if path.exists() {
                 let content = tokio::fs::read_to_string(&path).await?;
-                Ok(serde_json::from_str(&content).unwrap_or_default())
+                serde_json::from_str(&content).unwrap_or_default()
             } else {
-                Ok(Self::default())
+                Self::default()
+            };
+            if let Some(project_path) = Self::project_settings_path() {
+                if let Ok(raw) = tokio::fs::read_to_string(&project_path).await {
+                    settings.apply_project_overrides(&raw);
+                }
             }
+            Ok(settings)
         }
 
         /// Persist settings to disk.
@@ -677,12 +725,18 @@ pub mod config {
         /// Synchronous variant used by pre-session commands.
         pub fn load_sync() -> anyhow::Result<Self> {
             let path = Self::global_settings_path();
-            if path.exists() {
+            let mut settings: Self = if path.exists() {
                 let content = std::fs::read_to_string(&path)?;
-                Ok(serde_json::from_str(&content).unwrap_or_default())
+                serde_json::from_str(&content).unwrap_or_default()
             } else {
-                Ok(Self::default())
+                Self::default()
+            };
+            if let Some(project_path) = Self::project_settings_path() {
+                if let Ok(raw) = std::fs::read_to_string(&project_path) {
+                    settings.apply_project_overrides(&raw);
+                }
             }
+            Ok(settings)
         }
 
         /// Synchronous variant used by pre-session commands.

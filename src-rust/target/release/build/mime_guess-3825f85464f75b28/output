@@ -1,0 +1,1 @@
+cargo:rustc-env=MIME_TYPES_GENERATED_PATH=C:\Users\jiwon\source\claurst\src-rust\target\release\build\mime_guess-3825f85464f75b28\out\mime_types_generated.rs
