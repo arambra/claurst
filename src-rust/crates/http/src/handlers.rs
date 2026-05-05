@@ -188,12 +188,24 @@ pub async fn ask_handler(
 ) -> Result<Json<AskResponse>, (StatusCode, Json<AskErrorResponse>)> {
     let question = validate_question(&req.question)?;
 
-    // Log the length, NOT the content. The question may carry PII or
-    // operational secrets the operator does not want in logs.
+    // Log a bounded preview of the question alongside its length. The
+    // truncation cap (`MAX_LOGGED_QUESTION_BYTES`) keeps a pathological
+    // multi-MB prompt from producing one log line per request that's too
+    // large for Container Apps' line buffer or KQL ingestion. The full byte
+    // count is still emitted as `question_len`, so operators can spot
+    // truncated payloads by comparing it against the rendered `question`.
+    //
+    // Operators who do NOT want prompt content in logs (PII / secret-bearing
+    // payloads) should keep this deployment behind the X-API-Key gate and
+    // restrict log-stream access — the field intentionally shows the user
+    // input verbatim within the cap so debugging the agentic loop's
+    // behaviour does not require an out-of-band reproducer.
+    let question_preview = truncate_question_for_log(&question, MAX_LOGGED_QUESTION_BYTES);
     info!(
         question_len = question.len(),
         tool_count = state.tools.len(),
         max_turns = state.query_config.max_turns,
+        question = %question_preview,
         "/ask request received"
     );
 
@@ -347,6 +359,42 @@ fn validate_question(
         ));
     }
     Ok(trimmed.to_string())
+}
+
+/// Maximum number of bytes of the user `question` to render into the
+/// `/ask request received` log event. Lines above this are head-truncated
+/// with a marker indicating the original byte count.
+///
+/// Sized to comfortably fit a typical Container Apps console-log line (the
+/// platform truncates very long lines on ingestion). 64 KiB is large enough
+/// to cover normal questions and the leading portion of a question whose
+/// payload includes one or more inlined files, while bounding worst-case
+/// log volume per request.
+const MAX_LOGGED_QUESTION_BYTES: usize = 64 * 1024;
+
+/// Render the user question for logging, head-truncating at a UTF-8 char
+/// boundary if it exceeds `max_bytes`.
+///
+/// Returns a [`Cow::Borrowed`] when the question already fits and a
+/// [`Cow::Owned`] formatted preview otherwise — so a sub-cap question is
+/// logged with zero allocation. The truncation marker carries the original
+/// byte length so the operator can correlate against the structured
+/// `question_len` field.
+fn truncate_question_for_log(question: &str, max_bytes: usize) -> std::borrow::Cow<'_, str> {
+    if question.len() <= max_bytes {
+        return std::borrow::Cow::Borrowed(question);
+    }
+    // Walk back from `max_bytes` to the nearest UTF-8 char boundary so the
+    // slice is valid even if the cap lands inside a multibyte character.
+    let mut idx = max_bytes;
+    while idx > 0 && !question.is_char_boundary(idx) {
+        idx -= 1;
+    }
+    std::borrow::Cow::Owned(format!(
+        "{}…[truncated, total {} bytes]",
+        &question[..idx],
+        question.len()
+    ))
 }
 
 /// Count tool-use blocks recorded in an assistant message. Used purely for
@@ -503,6 +551,63 @@ mod tests {
                 "message": "no question",
             })
         );
+    }
+
+    // -------- truncate_question_for_log --------
+
+    #[test]
+    fn truncate_question_for_log_returns_borrowed_when_within_cap() {
+        let q = "hello world";
+        let out = truncate_question_for_log(q, 64);
+        // Cap not exceeded → must be the borrowed input verbatim.
+        assert!(matches!(out, std::borrow::Cow::Borrowed(_)));
+        assert_eq!(out, "hello world");
+    }
+
+    #[test]
+    fn truncate_question_for_log_truncates_when_over_cap() {
+        let q: String = "x".repeat(1000);
+        let out = truncate_question_for_log(&q, 100);
+        assert!(matches!(out, std::borrow::Cow::Owned(_)));
+        assert!(
+            out.contains("[truncated, total 1000 bytes]"),
+            "marker must carry the original byte count, got: {out}"
+        );
+        // The rendered preview must include exactly `cap` head bytes plus
+        // the truncation marker (no more). We check the head boundary by
+        // confirming the first `cap` bytes match the input.
+        assert!(out.starts_with(&"x".repeat(100)));
+    }
+
+    #[test]
+    fn truncate_question_for_log_respects_utf8_boundaries() {
+        // 4-byte char (😀 = U+1F600) repeated; cap lands mid-char.
+        let q: String = "😀".repeat(20); // 80 bytes total, 20 chars
+        // Cap of 7 bytes lands inside the second emoji. The function must
+        // walk back to the boundary at 4 (after the first emoji) to keep
+        // the slice valid UTF-8.
+        let out = truncate_question_for_log(&q, 7);
+        assert!(matches!(out, std::borrow::Cow::Owned(_)));
+        // The owned form must start with exactly one emoji (4 bytes) and
+        // then the truncation marker — never a malformed partial codepoint.
+        let owned = out.into_owned();
+        assert!(owned.starts_with("😀"));
+        assert!(owned.contains("[truncated, total 80 bytes]"));
+        // Whatever we sliced into the head must itself be valid UTF-8 (the
+        // String::from_utf8 path already guarantees this, but assert it
+        // explicitly so a future refactor that reaches for unsafe slicing
+        // is caught).
+        assert!(std::str::from_utf8(owned.as_bytes()).is_ok());
+    }
+
+    #[test]
+    fn truncate_question_for_log_zero_cap_truncates_to_marker() {
+        let q = "anything";
+        let out = truncate_question_for_log(q, 0);
+        assert!(matches!(out, std::borrow::Cow::Owned(_)));
+        // With cap 0 the head slice is empty; only the marker remains.
+        assert!(out.starts_with("…[truncated"));
+        assert!(out.contains("total 8 bytes"));
     }
 
     // -------- count_tool_uses --------

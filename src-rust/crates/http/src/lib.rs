@@ -23,12 +23,20 @@
 //!     router (typically *outermost*, so it bounds even the auth-middleware
 //!     phase) and the agentic loop is cut off before the platform-level
 //!     deadline can return an opaque 504 to the client.
+//!   * [`with_request_logging`] — outermost access-log layer that emits a
+//!     structured `info!` event on request start (method, URI, declared
+//!     Content-Length) and another on response (status, latency). Apply on
+//!     top of every other layer so it captures requests rejected by inner
+//!     layers (timeouts, auth failures, extractor errors) as well as
+//!     successful handler invocations. Bodies and headers other than
+//!     `Content-Length` are deliberately not logged.
 //!   * [`serve`] — convenience entry point: binds a [`TcpListener`] to the
 //!     supplied [`SocketAddr`] and serves [`build_router`] on it, wrapped in
-//!     [`with_request_timeout`] so the 240-second cap is applied even when
-//!     callers don't compose extra middleware. Suitable for tests / dev / any
-//!     deployment that wires auth in some other way (for instance, in front
-//!     of the process at the ingress layer).
+//!     [`with_request_timeout`] and [`with_request_logging`] so the
+//!     240-second cap and access log are applied even when callers don't
+//!     compose extra middleware. Suitable for tests / dev / any deployment
+//!     that wires auth in some other way (for instance, in front of the
+//!     process at the ingress layer).
 //!   * [`handlers::ask_handler`] / [`handlers::AskState`] /
 //!     [`AskErrorResponse`] — the handler the router dispatches to, the state
 //!     it closes over, and the JSON error envelope it returns on non-2xx
@@ -66,11 +74,16 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use axum::{http::StatusCode, routing::post, Router};
+use axum::{
+    body::Body,
+    http::{header, Request, Response, StatusCode},
+    routing::post,
+    Router,
+};
 use cc_tools::{TodoWriteTool, Tool, WebFetchTool};
 use tokio::net::TcpListener;
-use tower_http::timeout::TimeoutLayer;
-use tracing::info;
+use tower_http::{timeout::TimeoutLayer, trace::TraceLayer};
+use tracing::{info, info_span, Span};
 
 // ---------------------------------------------------------------------------
 // Restricted tool registry
@@ -187,6 +200,60 @@ pub fn with_request_timeout(router: Router) -> Router {
 }
 
 // ---------------------------------------------------------------------------
+// Per-request access log
+// ---------------------------------------------------------------------------
+
+/// Wrap a [`Router`] with an HTTP access-log layer that emits a structured
+/// `info!` line on request entry and on response.
+///
+/// Apply this as the **outermost** layer in the stack so it observes every
+/// request that reaches the server — including those that are synthesised
+/// off by inner layers (timeout 408/504, auth 401, body-extractor 400/415,
+/// route 404). Operators tailing `az containerapp logs show` see one start
+/// line and one end line per request, with method, URI, declared
+/// `Content-Length`, response status, and wall-clock latency. Both lines
+/// share a `http_request` span, so any handler-emitted events (such as
+/// `ask_handler`'s `question_len` log) inherit the request context
+/// automatically.
+///
+/// Fields are deliberately limited to non-sensitive request metadata. The
+/// request body, query string contents, and request/response headers other
+/// than `Content-Length` are **not** logged — bodies may carry user prompts
+/// with PII, and headers carry the `X-API-Key` credential.
+pub fn with_request_logging(router: Router) -> Router {
+    let trace_layer = TraceLayer::new_for_http()
+        .make_span_with(|req: &Request<Body>| {
+            // `Content-Length` is what the client *declared*; the actual
+            // bytes read may differ (chunked encoding, truncation), but
+            // declared length is what surfaces oversized prompts before any
+            // body extractor runs and is the cheapest correlator for "big
+            // request hit /ask".
+            let content_length = req
+                .headers()
+                .get(header::CONTENT_LENGTH)
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("-");
+            info_span!(
+                "http_request",
+                method = %req.method(),
+                uri = %req.uri(),
+                content_length = %content_length,
+            )
+        })
+        .on_request(|_req: &Request<Body>, _span: &Span| {
+            info!("incoming request");
+        })
+        .on_response(|resp: &Response<Body>, latency: Duration, _span: &Span| {
+            info!(
+                status = %resp.status(),
+                latency_ms = latency.as_millis() as u64,
+                "request completed"
+            );
+        });
+    router.layer(trace_layer)
+}
+
+// ---------------------------------------------------------------------------
 // Router & server entry points
 // ---------------------------------------------------------------------------
 
@@ -249,7 +316,11 @@ pub async fn serve(addr: SocketAddr, state: AskState) -> std::io::Result<()> {
         timeout_secs = REQUEST_TIMEOUT_SECS,
         "cc-http server listening"
     );
-    axum::serve(listener, with_request_timeout(build_router(state))).await
+    axum::serve(
+        listener,
+        with_request_logging(with_request_timeout(build_router(state))),
+    )
+    .await
 }
 
 // ---------------------------------------------------------------------------
@@ -691,6 +762,30 @@ mod tests {
             elapsed < std::time::Duration::from_secs(2),
             "timeout layer took {:?} to respond — expected ≪ 2 s",
             elapsed,
+        );
+    }
+
+    /// `with_request_logging` must be a transparent wrapper for the request
+    /// path: a request that would normally produce a 400 from the handler
+    /// must still produce a 400 once wrapped, with no header/body changes.
+    /// The log layer's job is observability, not transformation.
+    #[tokio::test]
+    async fn with_request_logging_passes_through_responses() {
+        let app = with_request_logging(with_request_timeout(build_router(dummy_ask_state())));
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri("/ask")
+            .header("content-type", "application/json")
+            .body(json_body(serde_json::json!({ "question": "" })))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        let (status, body) = read_body(resp).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            value.get("error").and_then(|v| v.as_str()),
+            Some("bad_request"),
+            "logging layer must not alter the error envelope"
         );
     }
 

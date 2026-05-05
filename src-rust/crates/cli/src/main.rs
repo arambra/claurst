@@ -1568,6 +1568,12 @@ async fn run_serve_mode() -> anyhow::Result<()> {
             Duration::from_secs(request_timeout_secs),
         ),
     );
+    // Per-request access log — applied OUTSIDE the timeout and auth layers so
+    // that requests rejected by those layers (408/504/401) still produce a
+    // start/end log pair in the Container Apps log stream. The log captures
+    // method, URI, declared Content-Length, response status, and latency.
+    // Bodies and credential-bearing headers are intentionally not logged.
+    let app = cc_http::with_request_logging(app);
 
     // ---- bind and serve --------------------------------------------------------
     let listener = tokio::net::TcpListener::bind(socket_addr)
