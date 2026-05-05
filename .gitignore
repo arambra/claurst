@@ -1,0 +1,19 @@
+# Rust build output
+src-rust/target
+**/target/
+*.rlib
+*.rmeta
+
+# Native compiled artifacts
+*.exe
+*.dll
+*.dll.exp
+*.dll.lib
+*.pdb
+*.so
+*.dylib
+*.a
+*.lib
+*.o
+*.obj
+*.d
