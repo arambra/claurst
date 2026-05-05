@@ -12,6 +12,7 @@ members = [
     "crates/cli",
     "crates/buddy",
     "crates/plugins",
+    "crates/http",
 ]
 
 [workspace.package]
@@ -30,6 +31,11 @@ async-trait = "0.1"
 # HTTP
 reqwest = { version = "0.12", features = ["json", "stream", "native-tls", "multipart"], default-features = false }
 reqwest-eventsource = "0.6"
+axum = { version = "0.7", features = ["macros", "tokio", "http1"] }
+tower = { version = "0.5", features = ["util"] }
+tower-http = { version = "0.6", features = ["trace", "timeout"] }
+http = "1"
+http-body-util = "0.1"
 
 # Serialization
 serde = { version = "1", features = ["derive"] }
@@ -98,3 +104,4 @@ cc-mcp = { path = "crates/mcp" }
 cc-bridge = { path = "crates/bridge" }
 cc-buddy = { path = "crates/buddy" }
 cc-plugins = { path = "crates/plugins" }
+cc-http = { path = "crates/http" }

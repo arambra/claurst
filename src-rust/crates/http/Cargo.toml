@@ -1,0 +1,71 @@
+[package]
+name = "cc-http"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "HTTP server crate for the Claude Code Rust port — hosts the synchronous /ask REST endpoint that delegates single-turn questions to the cc-query agentic loop with a restricted, read-only tool subset."
+
+# This crate intentionally has no [[bin]]: it is a library that the
+# `claude-code` binary (in `crates/cli`) can call into to host the REST
+# server. Keeping it as a library lets the auth middleware, router, and
+# handler be unit-tested without spinning up a process.
+
+[dependencies]
+# Workspace crates: server logic delegates to `cc-query`'s agentic loop and
+# uses `cc-core` types (Config, errors, message types, permissions) at the
+# boundary.
+cc-core = { workspace = true }
+cc-query = { workspace = true }
+# `cc-tools` supplies the `Tool` trait and the two whitelisted tool
+# implementations (`WebFetchTool`, `TodoWriteTool`) the /ask handler is
+# allowed to register, plus the `ToolContext` the agentic loop threads
+# through every tool invocation.
+cc-tools = { workspace = true }
+# `cc-api` provides the Anthropic-compatible HTTP client that the agentic
+# loop uses to talk to DeepSeek. The handler holds a shared `Arc` to one
+# client so a single connection pool is reused across requests.
+cc-api = { workspace = true }
+
+# Async runtime — Tokio with `full` features matches the rest of the
+# workspace and gives us the multi-thread runtime, signal handling, and
+# timers the server needs.
+tokio = { workspace = true }
+# `CancellationToken` is the cooperative-cancellation signal the cc-query
+# agentic loop expects. The handler builds a fresh, never-cancelled token
+# per request — outer middleware (timeout layer, ingress) is responsible
+# for bounding wall-clock duration.
+tokio-util = { workspace = true }
+
+# HTTP framework. axum 0.7 is already a workspace dependency; reusing the
+# pinned version keeps tower / tower-http / http compatible across crates.
+axum = { workspace = true }
+
+# `tower-http`'s `TimeoutLayer` enforces the per-request 240-second deadline
+# that mirrors the Azure Container Apps ingress idle timeout (see
+# deploy/configure-ingress.sh). The "timeout" feature is the only feature this
+# crate uses; the workspace pin already enables it alongside "trace".
+tower-http = { workspace = true }
+# `tower`'s `ServiceBuilder` and layer machinery are required to attach the
+# `TimeoutLayer` to an `axum::Router`. The "util" feature is enabled by the
+# workspace pin.
+tower = { workspace = true }
+
+# JSON request/response bodies. axum's `Json` extractor and the `AskRequest`
+# / `AskResponse` types both go through serde / serde_json.
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+# Structured logging. Required because the workspace convention (see
+# CLAUDE.md) is `tracing` macros, never `println!`.
+tracing = { workspace = true }
+
+[dev-dependencies]
+# Required to drive `Router` instances directly in unit tests via
+# `ServiceExt::oneshot` without binding a real TCP socket.
+tower = { workspace = true }
+# Lets handler integration tests collect the `axum::body::Body` stream into
+# bytes so we can parse the JSON response.
+http-body-util = { workspace = true }
+# `#[tokio::test]` for the async handler tests.
+tokio = { workspace = true }

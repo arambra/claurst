@@ -17,6 +17,7 @@ cc-commands = { workspace = true }
 cc-mcp = { workspace = true }
 cc-bridge = { workspace = true }
 cc-plugins = { workspace = true }
+cc-http = { workspace = true }
 tokio = { workspace = true }
 async-trait = { workspace = true }
 clap = { workspace = true }
@@ -31,3 +32,11 @@ chrono = { workspace = true }
 reqwest = { workspace = true }
 url = { workspace = true }
 crossterm = { workspace = true }
+axum = { workspace = true }
+tower = { workspace = true }
+tower-http = { workspace = true }
+http = { workspace = true }
+
+[dev-dependencies]
+http-body-util = { workspace = true }
+tower = { workspace = true, features = ["util"] }

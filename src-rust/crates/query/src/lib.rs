@@ -127,7 +127,7 @@ pub enum QueryEvent {
 pub async fn run_query_loop(
     client: &cc_api::AnthropicClient,
     messages: &mut Vec<Message>,
-    tools: &[Box<dyn Tool>],
+    tools: &[Arc<dyn Tool>],
     tool_ctx: &ToolContext,
     config: &QueryConfig,
     cost_tracker: Arc<CostTracker>,
@@ -419,7 +419,7 @@ pub async fn run_query_loop(
 async fn execute_tool(
     name: &str,
     input: &Value,
-    tools: &[Box<dyn Tool>],
+    tools: &[Arc<dyn Tool>],
     ctx: &ToolContext,
 ) -> ToolResult {
     let tool = tools.iter().find(|t| t.name() == name);
