@@ -59,26 +59,7 @@ without auth. The contract is pinned at the source by:
 
 ## Usage
 
-### Bash (CI / Linux / macOS / WSL)
-
-```bash
-export AZ_RESOURCE_GROUP=rg-claurst
-export AZ_CONTAINERAPP=claurst-ask
-export DEEPSEEK_API_KEY="sk-..."                    # from DeepSeek console
-export CLAURST_API_KEY="$(openssl rand -hex 32)"    # generate once, share with callers
-
-./deploy/configure-runtime.sh
-```
-
-Optional overrides:
-
-```bash
-TARGET_PORT=8080 \
-IDLE_TIMEOUT_MINUTES=4 \
-./deploy/configure-runtime.sh
-```
-
-### PowerShell (Windows)
+### PowerShell 7+ (Windows / Linux / macOS via `pwsh`)
 
 ```powershell
 $inbound = -join ((1..32) | ForEach-Object { '{0:x}' -f (Get-Random -Max 16) })
@@ -89,6 +70,9 @@ $inbound = -join ((1..32) | ForEach-Object { '{0:x}' -f (Get-Random -Max 16) })
   -DeepseekApiKey 'sk-...' `
   -ClaurstApiKey  $inbound
 ```
+
+Optional overrides — `-TargetPort 8080`, `-IdleTimeoutMinutes 4` — match the
+defaults; pass them only if you've changed the binary's listener port.
 
 Both scripts are idempotent: re-running them updates the existing
 configuration in place. The script:
@@ -105,9 +89,9 @@ configuration in place. The script:
 
 ## Verifying without leaking values
 
-```bash
-az containerapp show -n claurst-ask -g rg-claurst \
-  --query "{ingress: properties.configuration.ingress, secrets: properties.configuration.secrets[].name, env: properties.template.containers[0].env[?name=='DEEPSEEK_API_KEY' || name=='CLAURST_API_KEY']}" \
+```powershell
+az containerapp show -n claurst-ask -g rg-claurst `
+  --query "{ingress: properties.configuration.ingress, secrets: properties.configuration.secrets[].name, env: properties.template.containers[0].env[?name=='DEEPSEEK_API_KEY' || name=='CLAURST_API_KEY']}" `
   -o json
 ```
 
@@ -136,30 +120,33 @@ into the template instead of the secret reference — re-run
 
 ## Rotating a key
 
-```bash
-NEW=$(openssl rand -hex 32)
-DEEPSEEK_API_KEY="$EXISTING_DEEPSEEK_KEY" \
-CLAURST_API_KEY="$NEW" \
-./deploy/configure-runtime.sh
+```powershell
+$new = -join ((1..32) | ForEach-Object { '{0:x}' -f (Get-Random -Max 16) })
+
+./deploy/configure-runtime.ps1 `
+  -ResourceGroup  rg-claurst `
+  -ContainerApp   claurst-ask `
+  -DeepseekApiKey $existingDeepseekKey `
+  -ClaurstApiKey  $new
 
 # Re-running configure-runtime triggers a new revision; if you'd rather not
 # re-roll the revision, set just the secret value and restart the active one:
-az containerapp secret set \
-  --name claurst-ask --resource-group rg-claurst \
-  --secrets "claurst-api-key=$NEW"
-az containerapp revision restart \
-  --name claurst-ask --resource-group rg-claurst \
-  --revision "$(az containerapp revision list -n claurst-ask -g rg-claurst --query '[0].name' -o tsv)"
+az containerapp secret set `
+  --name claurst-ask --resource-group rg-claurst `
+  --secrets "claurst-api-key=$new"
+az containerapp revision restart `
+  --name claurst-ask --resource-group rg-claurst `
+  --revision (az containerapp revision list -n claurst-ask -g rg-claurst --query '[0].name' -o tsv)
 ```
 
 ## Relationship to the other scripts
 
-| Script                            | Scope                                      |
-| --------------------------------- | ------------------------------------------ |
-| `deploy/provision-app.sh`         | **Create** the Container App with ingress + identity. Run once per environment. |
-| `deploy/configure-ingress.sh`     | **Converge** ingress + traffic rules only (no secrets). Safe to run on every deploy. (AC 5 Sub-AC 3) |
-| `deploy/secrets/setup-secrets.sh` | Store secrets + bind env vars only (no ingress). Smaller cousin of `configure-runtime`. |
-| `deploy/configure-runtime.sh`     | **Converge** ingress + secrets + env vars on an existing app. Run after every config change or rotation. (AC 7 / 40103 Sub-AC 3) |
+| Script                              | Scope                                      |
+| ----------------------------------- | ------------------------------------------ |
+| `deploy/provision-app.ps1`          | **Create** the Container App with ingress + identity. Run once per environment; subsequent runs converge image + replica config. |
+| `deploy/configure-ingress.ps1`      | **Converge** ingress + traffic rules only (no secrets). Safe to run on every deploy. (AC 5 Sub-AC 3) |
+| `deploy/secrets/setup-secrets.ps1`  | Store secrets + bind env vars only (no ingress). Smaller cousin of `configure-runtime`. |
+| `deploy/configure-runtime.ps1`      | **Converge** ingress + secrets + env vars on an existing app. Run after every config change or rotation. (AC 7 / 40103 Sub-AC 3) |
 
 `configure-runtime` is a strict superset of `setup-secrets` (it does
 everything `setup-secrets` does plus the ingress assertions). `setup-secrets`
@@ -173,4 +160,4 @@ but takes no secret material, so it's safe to wire into a routine
 "reconcile-on-every-deploy" job without exposing the operator's keys. It
 also adds the explicit `--revision-weight latest=100` traffic-rule
 assertion that `configure-runtime` does not — see the comments in
-`deploy/configure-ingress.sh` for the rationale.
+`deploy/configure-ingress.ps1` for the rationale.

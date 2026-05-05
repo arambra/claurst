@@ -45,7 +45,7 @@
 # Required parameters (positional or named):
 #   -ResourceGroup           Workload resource group (default: FGF-EDI-SANDBOX;
 #                            must match provision-env.ps1).
-#   -ContainerAppName        Container App name (default: mapagent). 2-32 chars,
+#   -ContainerAppName        Container App name (default: claurst-ask). 2-32 chars,
 #                            lowercase alphanumeric + hyphens; appears as the
 #                            per-app DNS label.
 #   -ContainerAppsEnv        Name of the managed environment from provision-env.ps1
@@ -59,7 +59,7 @@
 #                            <AcrName>.azurecr.io/<ImageName>:<ImageTag>.
 #
 # Optional parameters:
-#   -ImageName               Image repo name within the registry (default: map-agent).
+#   -ImageName               Image repo name within the registry (default: claurst-ask).
 #   -TargetPort              Container port the binary listens on (default: 8080,
 #                            matches the Dockerfile's EXPOSE).
 #   -AcrResourceGroup        Group containing the ACR if separate from
@@ -71,9 +71,9 @@
 #
 # Example:
 #   ./deploy/provision-app.ps1 -ImageTag v0.1.0
-#   # (uses defaults: -ResourceGroup FGF-EDI-SANDBOX, -ContainerAppName mapagent,
+#   # (uses defaults: -ResourceGroup FGF-EDI-SANDBOX, -ContainerAppName claurst-ask,
 #   #                 -ContainerAppsEnv mapagentenv, -AcrName mapagentacr,
-#   #                 -IdentityName mapagentid, -ImageName map-agent)
+#   #                 -IdentityName mapagentid, -ImageName claurst-ask)
 #
 # Re-running the script with the same inputs is safe: an existing app is
 # updated rather than re-created, and image / replica / identity settings are
@@ -87,7 +87,7 @@ param(
     # alphanumeric + hyphens, must start and end alphanumeric. Catches typos
     # client-side (same posture as provision-env.ps1's environment validation).
     [ValidatePattern('^[a-z0-9]([-a-z0-9]{0,30}[a-z0-9])?$')]
-    [string] $ContainerAppName = 'mapagent',
+    [string] $ContainerAppName = 'claurst-ask',
 
     [string] $ContainerAppsEnv = 'mapagentenv',
 
@@ -102,7 +102,7 @@ param(
 
     [Parameter(Mandatory = $true)] [string] $ImageTag,
 
-    [string] $ImageName             = 'map-agent',
+    [string] $ImageName             = 'claurst-ask',
 
     # Target port sanity: must be a valid 16-bit port. The Dockerfile's
     # EXPOSE 8080 is what the binary actually binds to; allowing operators to
@@ -290,38 +290,81 @@ if ([string]::IsNullOrWhiteSpace($existingAppId)) {
 else {
     Write-Host ">> Container App '$ContainerAppName' already exists — updating image and replica config..."
     # Update path: don't repeat `--environment` (immutable) or `--ingress`
-    # (its own subcommand). The four flags below are the ones that safely
-    # converge a previously-deployed app to the desired state on every re-run.
+    # (its own subcommand). `--revisions-mode` is also create-only — it is
+    # asserted via `az containerapp revision set-mode` below. The three flags
+    # here are the ones that safely converge a previously-deployed app to
+    # the desired state on every re-run.
     az containerapp update `
         --name $ContainerAppName `
         --resource-group $ResourceGroup `
         --image $imageRef `
         --min-replicas 1 `
         --max-replicas 1 `
-        --revisions-mode single `
         --output none
     if ($LASTEXITCODE -ne 0) { throw "az containerapp update failed (exit $LASTEXITCODE)" }
+
+    # Pin the revision mode separately. Idempotent: a no-op if the app is
+    # already in Single mode. Required because `az containerapp update` does
+    # not accept `--revisions-mode` (create-only flag); leaving the mode
+    # unasserted would let a portal-side change to Multiple mode silently
+    # drift the production posture.
+    Write-Host ">> Pinning revisions-mode = Single..."
+    az containerapp revision set-mode `
+        --name $ContainerAppName `
+        --resource-group $ResourceGroup `
+        --mode single `
+        --output none
+    if ($LASTEXITCODE -ne 0) { throw "az containerapp revision set-mode failed (exit $LASTEXITCODE)" }
 
     # Identity attachment and ACR-pull-via-identity have to be re-asserted via
     # their dedicated subcommands; `az containerapp update` doesn't accept the
     # `--user-assigned` / `--registry-identity` flags (those are create-only).
-    # Both calls below are idempotent and no-op on the existing config.
+    #
+    # These calls are best-effort on the update path: they fail with
+    # `InvalidIdentityValues` when the app already pulls from ACR via admin
+    # username/password (the configuration `deploy/acr.bicep` provisions when
+    # `adminUserEnabled = true`) — ARM rejects the attempt to PATCH the
+    # `UserAssignedIdentities` collection while the registry binding still
+    # references a password secret. The image swap above already succeeded,
+    # so a failure here is a config-drift warning, not a deploy failure.
+    # Force a UAMI migration by recreating the app or running the create
+    # path explicitly; do not let it block routine image rolls.
     Write-Host ">> Ensuring user-assigned identity is attached..."
     az containerapp identity assign `
         --name $ContainerAppName `
         --resource-group $ResourceGroup `
         --user-assigned $identityResourceId `
         --output none
-    if ($LASTEXITCODE -ne 0) { throw "az containerapp identity assign failed (exit $LASTEXITCODE)" }
+    if ($LASTEXITCODE -ne 0) {
+        Write-Warning "az containerapp identity assign exited $LASTEXITCODE — continuing (image swap already succeeded)."
+    }
 
-    Write-Host ">> Ensuring ACR pulls authenticate via the UAMI..."
-    az containerapp registry set `
+    # Skip the UAMI rebind if the current registry binding uses admin/token creds
+    # (username set, identity empty). Forcing a flip back to UAMI auth when the
+    # UAMI lacks AcrPull on the registry causes a 15-25 min platform-side retry
+    # hang — the new binding can't be validated, so the operation never reaches
+    # a terminal state quickly. Leaving the working creds-based binding alone
+    # keeps deploys idempotent until UAMI is granted AcrPull (then this branch
+    # naturally flips back via the create path or a manual rebind).
+    $currentRegUser = az containerapp show `
         --name $ContainerAppName `
         --resource-group $ResourceGroup `
-        --server $acrLoginServer `
-        --identity $identityResourceId `
-        --output none
-    if ($LASTEXITCODE -ne 0) { throw "az containerapp registry set failed (exit $LASTEXITCODE)" }
+        --query "properties.configuration.registries[?server=='$acrLoginServer'].username | [0]" `
+        --output tsv 2>$null
+    if (-not [string]::IsNullOrWhiteSpace($currentRegUser)) {
+        Write-Host ">> Registry already bound via admin/token creds (username='$currentRegUser') — skipping UAMI rebind."
+    } else {
+        Write-Host ">> Ensuring ACR pulls authenticate via the UAMI..."
+        az containerapp registry set `
+            --name $ContainerAppName `
+            --resource-group $ResourceGroup `
+            --server $acrLoginServer `
+            --identity $identityResourceId `
+            --output none
+        if ($LASTEXITCODE -ne 0) {
+            Write-Warning "az containerapp registry set exited $LASTEXITCODE — continuing. Likely cause: the app currently pulls from ACR via admin username/password rather than UAMI; this is harmless if pulls keep succeeding. Re-create the app via the create path to migrate to UAMI auth."
+        }
+    }
 }
 
 # -----------------------------------------------------------------------------

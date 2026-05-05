@@ -31,18 +31,7 @@ followed by a revision restart; no code or template change.
 
 ## Usage
 
-### Bash (CI / Linux / macOS / WSL)
-
-```bash
-export AZ_RESOURCE_GROUP=rg-claurst
-export AZ_CONTAINERAPP=claurst-ask
-export DEEPSEEK_API_KEY="sk-..."                    # from DeepSeek console
-export CLAURST_API_KEY="$(openssl rand -hex 32)"    # generate once, share with callers
-
-./setup-secrets.sh
-```
-
-### PowerShell (Windows)
+### PowerShell 7+ (Windows / Linux / macOS via `pwsh`)
 
 ```powershell
 ./setup-secrets.ps1 `
@@ -59,15 +48,16 @@ not touch replica count or ingress).
 
 ## Rotating a key
 
-```bash
+```powershell
 # Rotate the inbound shared secret without downtime:
-NEW=$(openssl rand -hex 32)
-az containerapp secret set \
-  --name claurst-ask --resource-group rg-claurst \
-  --secrets "claurst-api-key=$NEW"
-az containerapp revision restart \
-  --name claurst-ask --resource-group rg-claurst \
-  --revision "$(az containerapp revision list -n claurst-ask -g rg-claurst --query '[0].name' -o tsv)"
+$new = -join ((1..32) | ForEach-Object { '{0:x}' -f (Get-Random -Max 16) })
+
+az containerapp secret set `
+  --name claurst-ask --resource-group rg-claurst `
+  --secrets "claurst-api-key=$new"
+az containerapp revision restart `
+  --name claurst-ask --resource-group rg-claurst `
+  --revision (az containerapp revision list -n claurst-ask -g rg-claurst --query '[0].name' -o tsv)
 ```
 
 The DeepSeek key rotates the same way — replace `claurst-api-key` with
@@ -75,9 +65,9 @@ The DeepSeek key rotates the same way — replace `claurst-api-key` with
 
 ## Verifying the binding (without leaking values)
 
-```bash
-az containerapp show -n claurst-ask -g rg-claurst \
-  --query "properties.template.containers[0].env[?name=='DEEPSEEK_API_KEY' || name=='CLAURST_API_KEY']" \
+```powershell
+az containerapp show -n claurst-ask -g rg-claurst `
+  --query "properties.template.containers[0].env[?name=='DEEPSEEK_API_KEY' || name=='CLAURST_API_KEY']" `
   -o table
 ```
 

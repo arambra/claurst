@@ -56,6 +56,33 @@ Two ways to run, pick one — don't mix:
 
 Config precedence (see `cc-core::config`): `Config` struct → `ANTHROPIC_API_KEY` / `ANTHROPIC_BASE_URL` env → built-in defaults. `Settings` is loaded from `.claude/settings.json`.
 
+## Deploy to Azure
+
+Three PowerShell scripts ship code from local to a running Container App. Run in order, with the same versioned tag (`vMAJOR.MINOR.PATCH`):
+
+| Step | Script | What it does |
+| --- | --- | --- |
+| 1. Build | `deploy/build-image.ps1` | `docker build` once, applies four tags to one digest: `claurst-ask:{latest,$tag}` and `<acr>.azurecr.io/claurst-ask:{latest,$tag}`. Does not push. |
+| 2. Push | `deploy/push-image.ps1` | Runs `acr-login.ps1` internally (refreshes the ~3 h ACR token), then `docker push` for both ACR-bound tags. |
+| 3. Provision | `deploy/provision-app.ps1` | Creates the Container App on first run; otherwise `az containerapp update --image …` and converges identity, registry, ingress, and revision mode. |
+
+```powershell
+$tag = 'v0.2.0'
+$acr = 'mapagentacr'
+
+./deploy/build-image.ps1   -AcrName $acr -ImageVersion $tag
+./deploy/push-image.ps1    -AcrName $acr -ImageVersion $tag
+./deploy/provision-app.ps1 -AcrName $acr -ImageTag $tag
+```
+
+Same `$tag` threads through all three. `build` and `push` use `-ImageVersion` (must match `^v\d+\.\d+\.\d+$`); `provision-app` uses `-ImageTag` (any tag, but matching the version is what makes the deploy reproducible).
+
+For routine image-only rolls (no config changes) skip the provision script and use `az containerapp update -n claurst-ask -g <rg> --image <ref>` directly — ~60-90s instead of ~3 min.
+
+Scripts are PowerShell 7+ only; runs on Linux/macOS via `pwsh`, so CI is not Windows-locked. The Bash counterparts that previously sat alongside have been removed.
+
+**One-time prerequisites** (per environment, before the first build): `provision-acr.ps1` → `provision-env.ps1` → `provision-identity.ps1` → `secrets/setup-secrets.ps1`. Detailed auth, ingress, and secret-rotation flows: `deploy/ACR-AUTH.md`, `deploy/RUNTIME-CONFIG.md`, `deploy/secrets/README.md`.
+
 ## Working in this codebase
 
 - **`spec/` is the source of truth for behavior.** When implementing or fixing a tool, command, or subsystem, consult the matching numbered spec file (see `spec/INDEX.md`) before reading other crates. The spec describes the upstream TS behavior the Rust port must match.
