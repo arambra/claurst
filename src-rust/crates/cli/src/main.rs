@@ -9,11 +9,18 @@
 //    - Interactive REPL mode: full TUI with ratatui
 
 mod oauth_flow;
+// `serve` and `serve_auth` live in `src/lib.rs` so integration tests can drive
+// the production server composition. The binary opts into server mode through
+// the `claude serve` subcommand fast-path below, which calls into
+// `claude_code::serve_auth` (X-API-Key middleware) and `cc_http`
+// (`build_router` + `AskState`) by name — keeping the modules in `lib.rs`
+// rather than redeclaring them here avoids double-compiling them into both the
+// binary and the integration-test target.
 
 use anyhow::Context;
 use cc_core::{
     config::{Config, PermissionMode, Settings},
-    constants::{APP_VERSION, DEFAULT_MODEL},
+    constants::APP_VERSION,
     context::ContextBuilder,
     cost::CostTracker,
     permissions::{AutoPermissionHandler, InteractivePermissionHandler},
@@ -99,9 +106,9 @@ struct Cli {
     #[arg(short = 'p', long = "print", action = ArgAction::SetTrue)]
     print: bool,
 
-    /// Model to use
-    #[arg(short = 'm', long = "model", default_value = DEFAULT_MODEL)]
-    model: String,
+    /// Model to use (overrides settings.json `config.model`)
+    #[arg(short = 'm', long = "model")]
+    model: Option<String>,
 
     /// Permission mode
     #[arg(long = "permission-mode", value_enum, default_value_t = CliPermissionMode::Default)]
@@ -242,6 +249,15 @@ async fn main() -> anyhow::Result<()> {
         return handle_auth_command(&raw_args[2..]).await;
     }
 
+    // Fast-path: `claude serve` — bring up the synchronous `POST /ask` REST server.
+    // This is the canonical entrypoint baked into the production Dockerfile
+    // (`CMD ["serve"]`) and into `deploy/provision-app.sh` / `verify-app.sh`.
+    // Intercepted before clap parsing so that the `serve` token is not mistaken
+    // for the positional `prompt` arg, mirroring the `auth` handling above.
+    if raw_args.get(1).map(|s| s.as_str()) == Some("serve") {
+        return run_serve_mode().await;
+    }
+
     // Fast-path: named commands (`claude agents`, `claude ide`, `claude branch`, …)
     // Check before Cli::parse() so these names don't conflict with positional prompt arg.
     if let Some(cmd_name) = raw_args.get(1).map(|s| s.as_str()) {
@@ -312,7 +328,9 @@ async fn main() -> anyhow::Result<()> {
     if let Some(ref key) = cli.api_key {
         config.api_key = Some(key.clone());
     }
-    config.model = Some(cli.model.clone());
+    if let Some(ref m) = cli.model {
+        config.model = Some(m.clone());
+    }
     if let Some(mt) = cli.max_tokens {
         config.max_tokens = Some(mt);
     }
@@ -452,9 +470,16 @@ async fn main() -> anyhow::Result<()> {
     // Build the full tool list: built-ins from cc-tools plus AgentTool from cc-query
     // (AgentTool lives in cc-query to avoid a circular cc-tools ↔ cc-query dependency).
     // Wrap in Arc so the list can be shared by the main loop AND the cron scheduler.
-    let tools: Arc<Vec<Box<dyn cc_tools::Tool>>> = {
-        let mut v: Vec<Box<dyn cc_tools::Tool>> = cc_tools::all_tools();
-        v.push(Box::new(cc_query::AgentTool));
+    let tools: Arc<Vec<Arc<dyn cc_tools::Tool>>> = {
+        // cc-query's loop signature takes `&[Arc<dyn Tool>]` so the registry can
+        // be cheaply shared (e.g. with the cron scheduler and sub-agents) without
+        // re-instantiating tools. `Arc::from(Box<dyn T>)` is the canonical way to
+        // promote an owned trait object into shared ownership.
+        let mut v: Vec<Arc<dyn cc_tools::Tool>> = cc_tools::all_tools()
+            .into_iter()
+            .map(Arc::from)
+            .collect();
+        v.push(Arc::new(cc_query::AgentTool));
 
         // Register MCP server tools as wrappers.
         if let Some(ref manager_arc) = mcp_manager_arc {
@@ -464,7 +489,7 @@ async fn main() -> anyhow::Result<()> {
                     server_name,
                     manager: manager_arc.clone(),
                 };
-                v.push(Box::new(wrapper));
+                v.push(Arc::new(wrapper));
             }
             debug!(total_tools = v.len(), "MCP tools registered");
         }
@@ -564,7 +589,7 @@ async fn main() -> anyhow::Result<()> {
 async fn run_headless(
     cli: &Cli,
     client: Arc<cc_api::AnthropicClient>,
-    tools: Arc<Vec<Box<dyn cc_tools::Tool>>>,
+    tools: Arc<Vec<Arc<dyn cc_tools::Tool>>>,
     tool_ctx: ToolContext,
     query_config: cc_query::QueryConfig,
     cost_tracker: Arc<CostTracker>,
@@ -747,7 +772,7 @@ async fn run_headless(
 async fn run_interactive(
     config: Config,
     client: Arc<cc_api::AnthropicClient>,
-    tools: Arc<Vec<Box<dyn cc_tools::Tool>>>,
+    tools: Arc<Vec<Arc<dyn cc_tools::Tool>>>,
     tool_ctx: ToolContext,
     query_config: cc_query::QueryConfig,
     cost_tracker: Arc<CostTracker>,
@@ -1318,6 +1343,250 @@ async fn run_interactive(
         runtime.cancel.cancel();
     }
     restore_terminal(&mut terminal)?;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// `claude serve` subcommand: synchronous /ask REST server
+// ---------------------------------------------------------------------------
+//
+// This is the production entrypoint the Container Apps revision runs. It:
+//
+//   1. Reads `CLAURST_API_KEY` from the env (Container Apps secret) and builds
+//      the X-API-Key auth gate. Refuses to start auth-less.
+//   2. Reads `DEEPSEEK_API_KEY` from the env (Container Apps secret) and builds
+//      a `cc-api` client pointed at the DeepSeek Anthropic-compatible endpoint
+//      (`https://api.deepseek.com/anthropic` by default; override with
+//      `ANTHROPIC_BASE_URL`).
+//   3. Constructs an `AskState` with the restricted tool registry from
+//      `cc_http::restricted_tools()` (web_fetch + todo only — no bash, no
+//      file_write, no file_edit, no MCP).
+//   4. Composes the production stack:
+//        protect_router(cc_http::build_router(state), auth)
+//          .layer(TimeoutLayer::new(240s))
+//      so every request goes auth → ask_handler → agentic loop, with a wall
+//      clock cap matching the Container Apps ingress idle timeout.
+//   5. Binds to `0.0.0.0:8080` (matches `Dockerfile EXPOSE 8080` and
+//      `deploy/provision-app.sh --target-port 8080`).
+//
+// Configuration is by env var only — the seed contract forbids mounted
+// filesystem and IaC, and a flagless subcommand keeps `Dockerfile`'s
+// `CMD ["serve"]` untouched across config changes:
+//
+//   * CLAURST_API_KEY        (required) — inbound shared secret.
+//   * DEEPSEEK_API_KEY       (required) — upstream model auth.
+//   * ANTHROPIC_BASE_URL     (optional) — upstream base URL; default is
+//                            DeepSeek's Anthropic-compatible endpoint.
+//   * CLAURST_MODEL          (optional) — model identifier passed to upstream;
+//                            default `deepseek-chat`.
+//   * CLAURST_PORT           (optional) — TCP port to bind; default 8080.
+//   * CLAURST_BIND_ADDR      (optional) — bind address; default 0.0.0.0.
+//   * CLAURST_MAX_TURNS      (optional) — agentic loop turn cap; default 10.
+//   * CLAURST_REQUEST_TIMEOUT_SECS (optional) — request timeout in seconds;
+//                            default 240 (matches the Container Apps ingress
+//                            idle timeout per the seed contract).
+//
+// Any other startup error (port in use, missing env, malformed bind addr, …)
+// fails loud with a non-zero exit so Container Apps' replica controller
+// surfaces the misconfiguration in `runningStatus`.
+
+async fn run_serve_mode() -> anyhow::Result<()> {
+    use std::time::Duration;
+
+    use claude_code::serve_auth::ApiKeyAuth;
+    use tower_http::timeout::TimeoutLayer;
+
+    // ---- logging --------------------------------------------------------------
+    //
+    // Container Apps captures stdout/stderr into Log Analytics; structured JSON
+    // would be ideal but the rest of the binary uses plain tracing-subscriber's
+    // text format, so match that for consistency. `info` is the right default
+    // (per-request lines, no debug spans flooding the log) — operators bump to
+    // `debug` via RUST_LOG when diagnosing.
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
+        )
+        .with_target(false)
+        .init();
+
+    info!("starting `claude serve` — synchronous POST /ask REST server");
+
+    // ---- inbound auth gate ----------------------------------------------------
+    //
+    // ApiKeyAuth::from_env reads CLAURST_API_KEY, refusing to start if the var
+    // is unset or empty. The Container Apps secret binding from
+    // deploy/secrets/setup-secrets.sh wires the secret to this exact var name.
+    let auth = ApiKeyAuth::from_env().with_context(|| {
+        "CLAURST_API_KEY not set or empty — refusing to start auth-less. \
+         Wire the Container Apps `claurst-api-key` secret to the \
+         CLAURST_API_KEY env var (see deploy/secrets/setup-secrets.sh)."
+    })?;
+
+    // ---- upstream credentials -------------------------------------------------
+    //
+    // Read DEEPSEEK_API_KEY directly from the env rather than going through the
+    // Settings/Config plumbing — the production container has no mounted
+    // settings.json and the seed contract forbids one. Failing fast here makes
+    // the misconfiguration obvious in container logs rather than surfacing as
+    // a 502 on the first request.
+    let deepseek_api_key = std::env::var("DEEPSEEK_API_KEY")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "DEEPSEEK_API_KEY not set or empty — refusing to start without upstream \
+                 credentials. Wire the Container Apps `deepseek-api-key` secret to the \
+                 DEEPSEEK_API_KEY env var (see deploy/secrets/setup-secrets.sh)."
+            )
+        })?;
+
+    // Default to DeepSeek's Anthropic-compatible endpoint (matches local dev
+    // in `.claude/settings.json`). `ANTHROPIC_BASE_URL` is the same env var the
+    // rest of the binary already honours, so operators who already know how to
+    // point local `claude` at a different endpoint don't have to learn a new
+    // name.
+    let api_base = std::env::var("ANTHROPIC_BASE_URL")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "https://api.deepseek.com/anthropic".to_string());
+
+    let model = std::env::var("CLAURST_MODEL")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "deepseek-chat".to_string());
+
+    let max_turns: u32 = std::env::var("CLAURST_MAX_TURNS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(cc_core::constants::MAX_TURNS_DEFAULT);
+
+    let request_timeout_secs: u64 = std::env::var("CLAURST_REQUEST_TIMEOUT_SECS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .filter(|secs: &u64| *secs > 0)
+        .unwrap_or(240);
+
+    let bind_addr = std::env::var("CLAURST_BIND_ADDR")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "0.0.0.0".to_string());
+    let port: u16 = std::env::var("CLAURST_PORT")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(8080);
+    let socket_addr: std::net::SocketAddr = format!("{bind_addr}:{port}")
+        .parse()
+        .with_context(|| format!("invalid bind address: {bind_addr}:{port}"))?;
+
+    info!(
+        %api_base,
+        %model,
+        max_turns,
+        request_timeout_secs,
+        bind = %socket_addr,
+        "resolved server configuration"
+    );
+
+    // ---- cc-api client --------------------------------------------------------
+    //
+    // The cc-api client is a thin wrapper around reqwest; it'll do a real
+    // network call only when a request hits the agentic loop. Constructing it
+    // up-front (rather than per-request) shares the underlying HTTP/1.1
+    // connection pool across requests, which matters under the few-concurrent
+    // users traffic profile described in the seed.
+    let client = Arc::new(
+        cc_api::AnthropicClient::new(cc_api::client::ClientConfig {
+            api_key: deepseek_api_key,
+            api_base,
+            ..Default::default()
+        })
+        .context("failed to construct upstream cc-api client")?,
+    );
+
+    // ---- ask handler state ----------------------------------------------------
+    //
+    // ToolContext for the restricted tool registry. We pass an
+    // AutoPermissionHandler in Default mode — there's no human in the loop to
+    // approve permissions, and the restricted registry only contains read-only
+    // tools that the auto handler approves anyway. A non-Default mode would be
+    // confusing without changing behaviour. Working dir is whatever the
+    // container's WORKDIR is (`/app` per the Dockerfile). `mcp_manager: None`
+    // is the security guarantee: no MCP wrappers ever reach this state.
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/app"));
+    let cost_tracker = CostTracker::new();
+    let session_id = uuid::Uuid::new_v4().to_string();
+    let tool_ctx = ToolContext {
+        working_dir: cwd,
+        permission_mode: PermissionMode::Default,
+        permission_handler: Arc::new(AutoPermissionHandler {
+            mode: PermissionMode::Default,
+        }),
+        cost_tracker: cost_tracker.clone(),
+        session_id,
+        non_interactive: true,
+        mcp_manager: None,
+        config: Config::default(),
+    };
+
+    let query_config = cc_query::QueryConfig {
+        model,
+        max_tokens: cc_core::constants::DEFAULT_MAX_TOKENS,
+        max_turns,
+        // Empty system prompt for the restricted /ask endpoint: the Seed has
+        // no spec for system-prompt content here, and a context-loaded prompt
+        // (CLAUDE.md, git status, ...) would be misleading inside a container
+        // with no mounted workspace.
+        system_prompt: Some(String::new()),
+        // Inherit `output_style` (and any other future fields the QueryConfig
+        // struct grows) from `Default::default()` so this builder stays
+        // forward-compatible. The /ask handler returns plain text either way;
+        // styling is irrelevant for a synchronous JSON response.
+        ..cc_query::QueryConfig::default()
+    };
+
+    let state = cc_http::AskState::new(client, tool_ctx, query_config, cost_tracker);
+
+    // ---- compose router stack -------------------------------------------------
+    //
+    //   bare router (cc_http::build_router)
+    //     ↓ wrapped with X-API-Key gate (claude_code::serve_auth::protect_router)
+    //     ↓ wrapped with 240s request timeout (tower_http::TimeoutLayer)
+    //
+    // The TimeoutLayer is OUTSIDE the auth layer on purpose: an unauthenticated
+    // attacker should not be able to hold a connection open past the timeout.
+    // (The auth layer rejects in microseconds, so this is mostly belt-and-
+    // suspenders, but the layer ordering is the right one regardless.)
+    // `with_status_code` makes the timeout exit explicit (504 Gateway Timeout)
+    // rather than the default 408 — 504 mirrors `cc_http::handlers::ask_handler`'s
+    // own `QueryOutcome::Cancelled` mapping, so a request that runs past the
+    // 240s deadline produces the same status whether the deadline tripped
+    // inside the agentic loop or the wrapping layer.
+    let app = claude_code::serve_auth::protect_router(cc_http::build_router(state), auth).layer(
+        TimeoutLayer::with_status_code(
+            axum::http::StatusCode::GATEWAY_TIMEOUT,
+            Duration::from_secs(request_timeout_secs),
+        ),
+    );
+    // Per-request access log — applied OUTSIDE the timeout and auth layers so
+    // that requests rejected by those layers (408/504/401) still produce a
+    // start/end log pair in the Container Apps log stream. The log captures
+    // method, URI, declared Content-Length, response status, and latency.
+    // Bodies and credential-bearing headers are intentionally not logged.
+    let app = cc_http::with_request_logging(app);
+
+    // ---- bind and serve --------------------------------------------------------
+    let listener = tokio::net::TcpListener::bind(socket_addr)
+        .await
+        .with_context(|| format!("failed to bind {socket_addr}"))?;
+    let local_addr = listener
+        .local_addr()
+        .context("failed to read local_addr from bound listener")?;
+    info!(%local_addr, "claude serve listening — POST /ask is live");
+
+    axum::serve(listener, app)
+        .await
+        .context("axum::serve exited with an error")?;
     Ok(())
 }
 

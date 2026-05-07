@@ -1,0 +1,31 @@
+# Rust build output
+src-rust/target
+**/target/
+*.rlib
+*.rmeta
+
+# Native compiled artifacts
+*.exe
+*.dll
+*.dll.exp
+*.dll.lib
+*.pdb
+*.so
+*.dylib
+*.a
+*.lib
+*.o
+*.obj
+*.d
+
+# test files
+test/*
+
+# Node modules from `npm install` (e.g. `jsonata` for the generate-jsonata
+# slash command's verification step). Reinstall on demand; do not commit.
+node_modules/
+
+# Local-only Claude Code state (per-user permission allowlist + runtime locks).
+# settings.json (shared config) stays tracked; *.local.json and lock files don't.
+.claude/settings.local.json
+.claude/*.lock

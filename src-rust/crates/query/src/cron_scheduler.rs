@@ -24,7 +24,7 @@ use tracing::{debug, error, info};
 /// Call `cancel.cancel()` to stop it gracefully.
 pub fn start_cron_scheduler(
     client: Arc<cc_api::AnthropicClient>,
-    tools: Arc<Vec<Box<dyn Tool>>>,
+    tools: Arc<Vec<Arc<dyn Tool>>>,
     tool_ctx: ToolContext,
     query_config: QueryConfig,
     cancel: CancellationToken,
@@ -36,7 +36,7 @@ pub fn start_cron_scheduler(
 
 async fn run_scheduler_loop(
     client: Arc<cc_api::AnthropicClient>,
-    tools: Arc<Vec<Box<dyn Tool>>>,
+    tools: Arc<Vec<Arc<dyn Tool>>>,
     tool_ctx: ToolContext,
     query_config: QueryConfig,
     cancel: CancellationToken,

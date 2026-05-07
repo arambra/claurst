@@ -129,13 +129,18 @@ impl Tool for AgentTool {
         // Build the tool list for the sub-agent.
         // Always exclude AgentTool itself to prevent unbounded recursion.
         let all = cc_tools::all_tools();
-        let agent_tools: Vec<Box<dyn Tool>> = if let Some(ref allowed) = params.tools {
+        // Convert Box<dyn Tool> → Arc<dyn Tool>: cc-query's loop now consumes
+        // shared-ownership tool registries so the same list can be referenced
+        // simultaneously by parents and sub-agents without re-instantiation.
+        let agent_tools: Vec<Arc<dyn Tool>> = if let Some(ref allowed) = params.tools {
             all.into_iter()
                 .filter(|t| allowed.contains(&t.name().to_string()))
+                .map(Arc::from)
                 .collect()
         } else {
             all.into_iter()
                 .filter(|t| t.name() != cc_core::constants::TOOL_NAME_AGENT)
+                .map(Arc::from)
                 .collect()
         };
 

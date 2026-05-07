@@ -1,0 +1,549 @@
+# provision-app.ps1 — create the Azure Container App that runs `claude serve`,
+# pulls its image from ACR via a user-assigned managed identity, and exposes
+# POST /ask on a public HTTPS ingress.
+#
+# PowerShell 7+ counterpart to provision-app.sh. Satisfies AC 40102 Sub-AC 2:
+# provision the Container App resource referencing the ACR-hosted image with
+# the managed identity attached for ACR pull authentication. Direct `az` CLI
+# only — no Bicep, no Terraform, no `azd`. The Seed forbids IaC for the
+# Container App itself; only the registry has a Bicep template (deploy/acr.bicep).
+#
+# Pre-requisites (run these scripts first, in order):
+#   1. deploy/provision-acr.ps1        → ACR exists; -AcrName is its name.
+#   2. deploy/provision-env.ps1        → Container Apps environment exists;
+#                                        -ContainerAppsEnv is its name.
+#   3. deploy/provision-identity.ps1   → User-assigned managed identity exists
+#                                        with the AcrPull role granted on the ACR;
+#                                        -IdentityName is its name.
+#   4. (Optional) deploy/push-image.ps1 → at least one tagged image exists at
+#                                        <Acr>.azurecr.io/<ImageName>:<ImageTag>.
+#
+# What this script does, in order:
+#   1. Confirms `az` is installed, the caller is logged in, and the
+#      `containerapp` extension is current (matches provision-env.ps1).
+#   2. Resolves the user-assigned managed identity's ARM resource ID + clientId
+#      from (-IdentityName, -IdentityResourceGroup) — fails fast if the UAMI
+#      hasn't been provisioned yet.
+#   3. Resolves the ACR login server (e.g. claurstacr123.azurecr.io) so the
+#      caller doesn't have to remember whether to include `.azurecr.io`.
+#   4. Verifies the Container Apps environment exists in the workload group
+#      (Sub-AC 2 must not silently materialize a fresh environment — that would
+#      bypass provision-env.ps1's Log Analytics wiring).
+#   5. Creates the Container App if it does not exist, or updates the existing
+#      one's image / replica configuration if it does. Both paths leave the app
+#      with:
+#        - the UAMI attached (`--user-assigned`)
+#        - ACR pulls authenticated via that UAMI (`--registry-identity`)
+#        - public HTTPS ingress on -TargetPort (default 8080)
+#        - exactly one replica (min=max=1, no auto-scale, single revision)
+#   6. Sets the platform request-timeout knob (`requestIdleTimeout = 4 minutes`,
+#      = 240s) on the ingress to match the Seed's synchronous-blocking AC. The
+#      Container Apps default already caps requests at 240s, but pinning the
+#      idle timeout keeps the configuration auditable and explicit.
+#   7. Prints the public FQDN so the operator can curl POST /ask immediately.
+#
+# Required parameters (positional or named):
+#   -ResourceGroup           Workload resource group (default: FGF-EDI-SANDBOX;
+#                            must match provision-env.ps1).
+#   -ContainerAppName        Container App name (default: claurst-ask). 2-32 chars,
+#                            lowercase alphanumeric + hyphens; appears as the
+#                            per-app DNS label.
+#   -ContainerAppsEnv        Name of the managed environment from provision-env.ps1
+#                            (default: mapagentenv).
+#   -AcrName                 Name (without `.azurecr.io`) of the registry from
+#                            provision-acr.ps1 (default: mapagentacr).
+#   -IdentityName            Name of the user-assigned managed identity from
+#                            provision-identity.ps1 (default: mapagentid).
+#   -ImageTag                Image tag to deploy (e.g. v0.1.0, latest, a git SHA).
+#                            The image is resolved as
+#                            <AcrName>.azurecr.io/<ImageName>:<ImageTag>.
+#
+# Optional parameters:
+#   -ImageName               Image repo name within the registry (default: claurst-ask).
+#   -TargetPort              Container port the binary listens on (default: 8080,
+#                            matches the Dockerfile's EXPOSE).
+#   -AcrResourceGroup        Group containing the ACR if separate from
+#                            -ResourceGroup (default: -ResourceGroup).
+#   -IdentityResourceGroup   Group containing the UAMI if separate from
+#                            -ResourceGroup (default: -ResourceGroup).
+#   -EnvResourceGroup        Group containing the Container Apps environment if
+#                            separate from -ResourceGroup (default: -ResourceGroup).
+#   -UseAdminCreds           Bind ACR pulls via admin username/password instead
+#                            of the UAMI. Required when the deployer lacks
+#                            Microsoft.Authorization/roleAssignments/write and
+#                            therefore cannot grant the UAMI AcrPull on the
+#                            registry (provision-identity.ps1 fails). The ACR
+#                            must have `adminUserEnabled = true` (acr.bicep
+#                            default) and the caller needs read access to the
+#                            registry's admin credentials (Contributor /
+#                            AcrPush / Owner). The password is stored as a
+#                            Container Apps secret managed by the platform.
+#                            The UAMI is still attached to the app (so workloads
+#                            keep their app-level identity) — only the *image
+#                            pull* path changes from UAMI → admin creds.
+#
+# Example:
+#   ./deploy/provision-app.ps1 -ImageTag v0.1.0
+#   # (uses defaults: -ResourceGroup FGF-EDI-SANDBOX, -ContainerAppName claurst-ask,
+#   #                 -ContainerAppsEnv mapagentenv, -AcrName mapagentacr,
+#   #                 -IdentityName mapagentid, -ImageName claurst-ask)
+#
+# Re-running the script with the same inputs is safe: an existing app is
+# updated rather than re-created, and image / replica / identity settings are
+# all idempotent under the chosen `az containerapp update` invocations.
+
+[CmdletBinding()]
+param(
+    [string] $ResourceGroup = 'FGF-EDI-SANDBOX',
+
+    # ValidatePattern mirrors Container Apps name rules: 2-32 chars, lowercase
+    # alphanumeric + hyphens, must start and end alphanumeric. Catches typos
+    # client-side (same posture as provision-env.ps1's environment validation).
+    [ValidatePattern('^[a-z0-9]([-a-z0-9]{0,30}[a-z0-9])?$')]
+    [string] $ContainerAppName = 'claurst-ask',
+
+    [string] $ContainerAppsEnv = 'mapagentenv',
+
+    # Mirror the ACR name validation from provision-acr.ps1 so a typo here
+    # gets caught locally instead of as a 404 from `az acr show`.
+    [ValidatePattern('^[a-zA-Z0-9]{5,50}$')]
+    [string] $AcrName = 'mapagentacr',
+
+    # Mirror the managed-identity name rules from provision-identity.ps1.
+    [ValidatePattern('^[a-zA-Z0-9][a-zA-Z0-9_-]{2,127}$')]
+    [string] $IdentityName = 'mapagentid',
+
+    [Parameter(Mandatory = $true)] [string] $ImageTag,
+
+    [string] $ImageName             = 'claurst-ask',
+
+    # Target port sanity: must be a valid 16-bit port. The Dockerfile's
+    # EXPOSE 8080 is what the binary actually binds to; allowing operators to
+    # override is purely for unusual side-loaded builds.
+    [ValidateRange(1, 65535)]
+    [int] $TargetPort               = 8080,
+
+    [string] $AcrResourceGroup      = '',
+    [string] $IdentityResourceGroup = '',
+    [string] $EnvResourceGroup      = '',
+
+    # Switch to bind ACR pulls via admin username/password instead of the UAMI.
+    # See header doc for the "deployer lacks RBAC write" use case this exists
+    # for. When set, the script reads admin creds via `az acr credential show`
+    # and binds them via `--registry-username` / `--registry-password`.
+    [switch] $UseAdminCreds
+)
+
+$ErrorActionPreference = 'Stop'
+
+# Default the secondary groups to the workload group if the operator didn't
+# pass any. Done after param() so we have access to $ResourceGroup as the
+# fallback. Kept as separate parameters (not a single -SharedResourceGroup)
+# because the registry, UAMI, and environment can each legitimately live in
+# their own "platform" group in a larger Azure landing-zone setup.
+if ([string]::IsNullOrWhiteSpace($AcrResourceGroup))      { $AcrResourceGroup      = $ResourceGroup }
+if ([string]::IsNullOrWhiteSpace($IdentityResourceGroup)) { $IdentityResourceGroup = $ResourceGroup }
+if ([string]::IsNullOrWhiteSpace($EnvResourceGroup))      { $EnvResourceGroup      = $ResourceGroup }
+
+# -----------------------------------------------------------------------------
+# Preflight: az CLI present, authenticated, containerapp extension installed
+# -----------------------------------------------------------------------------
+
+if (-not (Get-Command az -ErrorAction SilentlyContinue)) {
+    throw "az CLI not found on PATH — install from https://aka.ms/InstallAzureCLI"
+}
+
+$null = az account show --output none 2>$null
+if ($LASTEXITCODE -ne 0) {
+    throw "Not logged in to Azure. Run 'az login' (and 'az account set --subscription <id>') first."
+}
+
+$subscriptionName = az account show --query name --output tsv
+$subscriptionId   = az account show --query id   --output tsv
+
+$imageRef = "$AcrName.azurecr.io/$ImageName`:$ImageTag"
+
+$registryAuthMode = if ($UseAdminCreds) { 'admin credentials (-UseAdminCreds)' } else { 'user-assigned managed identity' }
+
+Write-Host ">> Active subscription: $subscriptionName ($subscriptionId)"
+Write-Host ">> Container App:       $ContainerAppName (group: $ResourceGroup)"
+Write-Host ">> Environment:         $ContainerAppsEnv (group: $EnvResourceGroup)"
+Write-Host ">> Registry:            $AcrName (group: $AcrResourceGroup)"
+Write-Host ">> Identity (UAMI):     $IdentityName (group: $IdentityResourceGroup)"
+Write-Host ">> Image:               $imageRef"
+Write-Host ">> Target port:         $TargetPort"
+Write-Host ">> Registry auth:       $registryAuthMode"
+
+Write-Host ">> Ensuring 'containerapp' Azure CLI extension is installed..."
+$installed = az extension list --query "[?name=='containerapp'].name | [0]" -o tsv 2>$null
+if ([string]::IsNullOrWhiteSpace($installed)) {
+    az extension add --name containerapp --only-show-errors --yes --output none
+    if ($LASTEXITCODE -ne 0) { throw "az extension add (containerapp) failed (exit $LASTEXITCODE). If pip is crashing with 0xC0000005, see deploy/README troubleshooting." }
+} else {
+    Write-Host "   (already installed; skipping add/upgrade)"
+}
+
+# -----------------------------------------------------------------------------
+# Step 1: resolve the user-assigned managed identity
+# -----------------------------------------------------------------------------
+
+# We need two fields off the UAMI:
+#   • id        — passed to `--user-assigned` (attach the identity to the app)
+#                 and `--registry-identity` (use it for ACR auth on pulls).
+#   • clientId  — surfaced in the summary block so the operator can sanity-check
+#                 the federated client without a second round-trip.
+# Failing here means provision-identity.ps1 hasn't been run; the error message
+# points the operator at the right script.
+Write-Host ">> Resolving user-assigned managed identity..."
+$identityResourceId = az identity show `
+    --name $IdentityName `
+    --resource-group $IdentityResourceGroup `
+    --query id `
+    --output tsv 2>$null
+
+$identityClientId = az identity show `
+    --name $IdentityName `
+    --resource-group $IdentityResourceGroup `
+    --query clientId `
+    --output tsv 2>$null
+
+if ([string]::IsNullOrWhiteSpace($identityResourceId) -or
+    [string]::IsNullOrWhiteSpace($identityClientId)) {
+    throw "User-assigned managed identity '$IdentityName' not found in resource group '$IdentityResourceGroup'. Run deploy/provision-identity.ps1 first, or set -IdentityResourceGroup if the UAMI lives in a different group."
+}
+
+# -----------------------------------------------------------------------------
+# Step 2: resolve the ACR login server (and confirm the registry exists)
+# -----------------------------------------------------------------------------
+
+# `az acr show --query loginServer` returns `<acr>.azurecr.io`. Resolving from
+# the registry record (rather than string-concatenating ourselves) means an
+# ACR with a custom data-plane suffix — e.g. an Azure Government tenant with
+# `.azurecr.us` — Just Works.
+Write-Host ">> Resolving ACR login server..."
+$acrLoginServer = az acr show `
+    --name $AcrName `
+    --resource-group $AcrResourceGroup `
+    --query loginServer `
+    --output tsv 2>$null
+
+if ([string]::IsNullOrWhiteSpace($acrLoginServer)) {
+    throw "ACR '$AcrName' not found in resource group '$AcrResourceGroup'. Run deploy/provision-acr.ps1 first, or set -AcrResourceGroup if the registry lives in a different group."
+}
+
+# Re-derive the image reference now that we have the canonical login server.
+# This handles the (rare) case where -AcrName is a sovereign-cloud registry
+# whose data plane uses something other than `.azurecr.io`.
+$imageRef = "$acrLoginServer/$ImageName`:$ImageTag"
+
+# -----------------------------------------------------------------------------
+# Step 2b (optional): resolve ACR admin credentials when -UseAdminCreds is set
+# -----------------------------------------------------------------------------
+
+# When the deployer lacks Microsoft.Authorization/roleAssignments/write they
+# cannot grant the UAMI AcrPull on the registry. Without that grant, Container
+# Apps' image-pull validation fails with:
+#   "unable to pull image using Managed identity ... for registry <acr>"
+# Falling back to the registry's built-in admin user is the documented escape
+# hatch (see deploy/ACR-AUTH.md "Runtime pull vs CI push") — Container Apps
+# stores the password as a managed secret and uses it for every pull.
+$acrAdminUser = $null
+$acrAdminPwd  = $null
+if ($UseAdminCreds) {
+    Write-Host ">> Resolving ACR admin credentials (UAMI bypass — caller lacks RBAC to grant AcrPull)..."
+    $acrAdminUser = az acr credential show `
+        --name $AcrName `
+        --resource-group $AcrResourceGroup `
+        --query username `
+        --output tsv 2>$null
+    $acrAdminPwd = az acr credential show `
+        --name $AcrName `
+        --resource-group $AcrResourceGroup `
+        --query "passwords[0].value" `
+        --output tsv 2>$null
+
+    if ([string]::IsNullOrWhiteSpace($acrAdminUser) -or
+        [string]::IsNullOrWhiteSpace($acrAdminPwd)) {
+        throw "Could not read ACR admin credentials for '$AcrName'. Confirm 'adminUserEnabled = true' on the registry (deploy/acr.bicep default) and that the active principal has Contributor / AcrPush / Owner on the registry (required for Microsoft.ContainerRegistry/registries/listCredentials/action)."
+    }
+}
+
+# -----------------------------------------------------------------------------
+# Step 3: confirm the Container Apps environment exists
+# -----------------------------------------------------------------------------
+
+# We deliberately do *not* create the environment here — that's
+# provision-env.ps1's job, and silently materialising a fresh one would skip
+# its Log Analytics wiring. Surface a clear "run the prereq" error instead.
+Write-Host ">> Resolving Container Apps environment..."
+$envResourceId = az containerapp env show `
+    --name $ContainerAppsEnv `
+    --resource-group $EnvResourceGroup `
+    --query id `
+    --output tsv 2>$null
+
+if ([string]::IsNullOrWhiteSpace($envResourceId)) {
+    throw "Container Apps environment '$ContainerAppsEnv' not found in resource group '$EnvResourceGroup'. Run deploy/provision-env.ps1 first, or set -EnvResourceGroup if the environment lives in a different group."
+}
+
+# -----------------------------------------------------------------------------
+# Step 4: create or update the Container App
+# -----------------------------------------------------------------------------
+
+# Pre-flight existence check: `az containerapp show` exits non-zero when the
+# app doesn't exist. Branching on this lets us call `create` only on the first
+# run and `update` afterwards, which is the cleanest path to idempotency given
+# `az containerapp create` 409s on duplicates.
+$existingAppId = az containerapp show `
+    --name $ContainerAppName `
+    --resource-group $ResourceGroup `
+    --query id `
+    --output tsv 2>$null
+
+if ([string]::IsNullOrWhiteSpace($existingAppId)) {
+    Write-Host ">> Creating Container App '$ContainerAppName' (this can take a couple of minutes)..."
+    # Flag-by-flag rationale (mirrors provision-app.sh):
+    #   --environment <id>            : pin to the env resolved in Step 3.
+    #   --image <ref>                 : ACR-hosted runtime image.
+    #   --user-assigned <UAMI id>     : attach the UAMI so the running container
+    #                                   inherits the identity (used for app-level
+    #                                   auth even when the registry pull path
+    #                                   uses admin creds).
+    #   --registry-server <login>     : tell Container Apps which registry to
+    #                                   pull from. Required alongside either
+    #                                   --registry-identity or
+    #                                   --registry-username/--registry-password.
+    #   --registry-identity <UAMI id> : (default path) authenticate ACR pulls via
+    #                                   the UAMI's AcrPull grant
+    #                                   (provision-identity.ps1 created this),
+    #                                   eliminating the ACR admin password from
+    #                                   Container Apps secrets.
+    #   --registry-username/-password : (-UseAdminCreds path) authenticate ACR
+    #                                   pulls with the registry's admin user.
+    #                                   Container Apps stores the password as a
+    #                                   managed secret. Used when the deployer
+    #                                   lacks roleAssignments/write to grant the
+    #                                   UAMI AcrPull.
+    #   --ingress external            : public HTTPS endpoint via the managed
+    #                                   reverse proxy.
+    #   --target-port <port>          : the port `claude serve` binds to inside
+    #                                   the container (Dockerfile EXPOSE 8080).
+    #   --transport auto              : let the platform pick HTTP/1.1 vs HTTP/2.
+    #   --min-replicas 1              : no scale-to-zero — cold starts here would
+    #                                   blow past the 240s sync deadline.
+    #   --max-replicas 1              : single replica, no auto-scale (Seed:
+    #                                   "single Azure Container Apps instance").
+    #   --revisions-mode single       : only one active revision at a time.
+    if ($UseAdminCreds) {
+        az containerapp create `
+            --name $ContainerAppName `
+            --resource-group $ResourceGroup `
+            --environment $envResourceId `
+            --image $imageRef `
+            --user-assigned $identityResourceId `
+            --registry-server $acrLoginServer `
+            --registry-username $acrAdminUser `
+            --registry-password $acrAdminPwd `
+            --ingress external `
+            --target-port $TargetPort `
+            --transport auto `
+            --min-replicas 1 `
+            --max-replicas 1 `
+            --revisions-mode single `
+            --output none
+    }
+    else {
+        az containerapp create `
+            --name $ContainerAppName `
+            --resource-group $ResourceGroup `
+            --environment $envResourceId `
+            --image $imageRef `
+            --user-assigned $identityResourceId `
+            --registry-server $acrLoginServer `
+            --registry-identity $identityResourceId `
+            --ingress external `
+            --target-port $TargetPort `
+            --transport auto `
+            --min-replicas 1 `
+            --max-replicas 1 `
+            --revisions-mode single `
+            --output none
+    }
+    if ($LASTEXITCODE -ne 0) { throw "az containerapp create failed (exit $LASTEXITCODE)" }
+}
+else {
+    Write-Host ">> Container App '$ContainerAppName' already exists — updating image and replica config..."
+
+    # When -UseAdminCreds is set we MUST rebind the registry to admin creds
+    # *before* the image update. Reason: `az containerapp update --image`
+    # provisions a new revision, which the platform validates by pulling the
+    # image with whatever auth the current registry binding declares. If the
+    # current binding is UAMI-based and the UAMI lacks AcrPull (the exact
+    # scenario this switch exists for), the pull fails and the update aborts
+    # before the binding can be changed. Reordering — bind first, then update
+    # — gives the new revision a working pull path on its first try.
+    if ($UseAdminCreds) {
+        Write-Host ">> Rebinding registry to admin credentials (pre-image-swap)..."
+        az containerapp registry set `
+            --name $ContainerAppName `
+            --resource-group $ResourceGroup `
+            --server $acrLoginServer `
+            --username $acrAdminUser `
+            --password $acrAdminPwd `
+            --output none
+        if ($LASTEXITCODE -ne 0) { throw "az containerapp registry set (admin creds) failed (exit $LASTEXITCODE)" }
+    }
+
+    # Update path: don't repeat `--environment` (immutable) or `--ingress`
+    # (its own subcommand). `--revisions-mode` is also create-only — it is
+    # asserted via `az containerapp revision set-mode` below. The three flags
+    # here are the ones that safely converge a previously-deployed app to
+    # the desired state on every re-run.
+    az containerapp update `
+        --name $ContainerAppName `
+        --resource-group $ResourceGroup `
+        --image $imageRef `
+        --min-replicas 1 `
+        --max-replicas 1 `
+        --output none
+    if ($LASTEXITCODE -ne 0) { throw "az containerapp update failed (exit $LASTEXITCODE)" }
+
+    # Pin the revision mode separately. Idempotent: a no-op if the app is
+    # already in Single mode. Required because `az containerapp update` does
+    # not accept `--revisions-mode` (create-only flag); leaving the mode
+    # unasserted would let a portal-side change to Multiple mode silently
+    # drift the production posture.
+    Write-Host ">> Pinning revisions-mode = Single..."
+    az containerapp revision set-mode `
+        --name $ContainerAppName `
+        --resource-group $ResourceGroup `
+        --mode single `
+        --output none
+    if ($LASTEXITCODE -ne 0) { throw "az containerapp revision set-mode failed (exit $LASTEXITCODE)" }
+
+    # Identity attachment and ACR-pull-via-identity have to be re-asserted via
+    # their dedicated subcommands; `az containerapp update` doesn't accept the
+    # `--user-assigned` / `--registry-identity` flags (those are create-only).
+    #
+    # These calls are best-effort on the update path: they fail with
+    # `InvalidIdentityValues` when the app already pulls from ACR via admin
+    # username/password (the configuration `deploy/acr.bicep` provisions when
+    # `adminUserEnabled = true`) — ARM rejects the attempt to PATCH the
+    # `UserAssignedIdentities` collection while the registry binding still
+    # references a password secret. The image swap above already succeeded,
+    # so a failure here is a config-drift warning, not a deploy failure.
+    # Force a UAMI migration by recreating the app or running the create
+    # path explicitly; do not let it block routine image rolls.
+    Write-Host ">> Ensuring user-assigned identity is attached..."
+    az containerapp identity assign `
+        --name $ContainerAppName `
+        --resource-group $ResourceGroup `
+        --user-assigned $identityResourceId `
+        --output none
+    if ($LASTEXITCODE -ne 0) {
+        Write-Warning "az containerapp identity assign exited $LASTEXITCODE — continuing (image swap already succeeded)."
+    }
+
+    # Skip the UAMI rebind if -UseAdminCreds is set (the registry was just bound
+    # to admin creds above — don't immediately flip it back) or if the current
+    # registry binding already uses admin/token creds (username set, identity
+    # empty). Forcing a flip back to UAMI auth when the UAMI lacks AcrPull on
+    # the registry causes a 15-25 min platform-side retry hang — the new binding
+    # can't be validated, so the operation never reaches a terminal state
+    # quickly. Leaving the working creds-based binding alone keeps deploys
+    # idempotent until UAMI is granted AcrPull (then this branch naturally flips
+    # back via the create path or a manual rebind).
+    if ($UseAdminCreds) {
+        Write-Host ">> Registry bound via admin credentials (-UseAdminCreds); skipping UAMI rebind."
+    } else {
+        $currentRegUser = az containerapp show `
+            --name $ContainerAppName `
+            --resource-group $ResourceGroup `
+            --query "properties.configuration.registries[?server=='$acrLoginServer'].username | [0]" `
+            --output tsv 2>$null
+        if (-not [string]::IsNullOrWhiteSpace($currentRegUser)) {
+            Write-Host ">> Registry already bound via admin/token creds (username='$currentRegUser') — skipping UAMI rebind."
+        } else {
+            Write-Host ">> Ensuring ACR pulls authenticate via the UAMI..."
+            az containerapp registry set `
+                --name $ContainerAppName `
+                --resource-group $ResourceGroup `
+                --server $acrLoginServer `
+                --identity $identityResourceId `
+                --output none
+            if ($LASTEXITCODE -ne 0) {
+                Write-Warning "az containerapp registry set exited $LASTEXITCODE — continuing. Likely cause: the app currently pulls from ACR via admin username/password rather than UAMI; this is harmless if pulls keep succeeding. Re-create the app via the create path to migrate to UAMI auth."
+            }
+        }
+    }
+}
+
+# -----------------------------------------------------------------------------
+# Step 5: pin the ingress idle timeout to 4 minutes (240s)
+# -----------------------------------------------------------------------------
+
+# Container Apps' HTTP request idle timeout is `ingress.idleTimeoutInMinutes`.
+# 4 minutes = 240s, which matches the Seed's synchronous-blocking AC. The
+# platform default already caps at 240s, but pinning the value explicitly:
+#   • makes the configuration auditable (visible in `az containerapp show`),
+#   • survives any future platform default change without a silent regression,
+#   • mirrors the Seed's `request_timeout_seconds` ontology concept.
+#
+# `az containerapp ingress update --idle-timeout-in-minutes` has been the
+# stable setter since the May-2024 CLI release. Older CLI versions silently
+# ignore unknown flags and exit 2; we tolerate that by allowing the call to
+# fail soft and warning the operator to upgrade if so.
+Write-Host ">> Setting ingress idle timeout to 4 minutes (240s)..."
+az containerapp ingress update `
+    --name $ContainerAppName `
+    --resource-group $ResourceGroup `
+    --idle-timeout-in-minutes 4 `
+    --output none 2>$null
+if ($LASTEXITCODE -ne 0) {
+    Write-Warning "ingress idle-timeout setter unavailable on this az version — the platform default of 240s still applies; upgrade az to silence this notice."
+    # Reset $LASTEXITCODE so the next az call's exit-code check isn't poisoned.
+    $global:LASTEXITCODE = 0
+}
+
+# -----------------------------------------------------------------------------
+# Step 6: surface the public FQDN and next-step commands
+# -----------------------------------------------------------------------------
+
+$appFqdn = az containerapp show `
+    --name $ContainerAppName `
+    --resource-group $ResourceGroup `
+    --query properties.configuration.ingress.fqdn `
+    --output tsv
+
+Write-Host ""
+Write-Host ">> Container App provisioning complete."
+Write-Host "   Container App:   $ContainerAppName"
+Write-Host "   Resource group:  $ResourceGroup"
+Write-Host "   Environment:     $ContainerAppsEnv"
+Write-Host "   Image:           $imageRef"
+Write-Host "   UAMI clientId:   $identityClientId"
+Write-Host "   Public FQDN:     https://$appFqdn"
+Write-Host ""
+Write-Host "   Next steps:"
+Write-Host ""
+Write-Host "   # 1. Wire the Container Apps secrets (DEEPSEEK_API_KEY + CLAURST_API_KEY)."
+Write-Host "   #    Required before the first request — the binary refuses to start"
+Write-Host "   #    without them."
+Write-Host "   ./deploy/secrets/setup-secrets.ps1 ``"
+Write-Host "     -ResourceGroup    $ResourceGroup ``"
+Write-Host "     -ContainerApp     $ContainerAppName ``"
+Write-Host "     -DeepseekApiKey   sk-... ``"
+Write-Host "     -ClaurstApiKey    (\$([Guid]::NewGuid()).ToString())"
+Write-Host ""
+Write-Host "   # 2. Smoke-test the endpoint:"
+Write-Host "   curl -sSf -X POST https://$appFqdn/ask ``"
+Write-Host "     -H `"X-API-Key: `$env:CLAURST_API_KEY`" ``"
+Write-Host "     -H 'Content-Type: application/json' ``"
+Write-Host "     -d '{`"question`":`"What is the capital of France?`"}'"
+Write-Host ""
+Write-Host "   # 3. Tail logs:"
+Write-Host "   az containerapp logs show ``"
+Write-Host "     --name $ContainerAppName ``"
+Write-Host "     --resource-group $ResourceGroup ``"
+Write-Host "     --follow"
+Write-Host ""

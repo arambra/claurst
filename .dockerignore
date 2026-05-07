@@ -1,0 +1,67 @@
+# .dockerignore — keep the Docker build context small.
+#
+# The Dockerfile only needs `src-rust/` (the Cargo workspace) to produce
+# the `claude` binary. Everything else in the repo is either:
+#   * spec text and reference material (spec/, public/, test/),
+#   * deployment scripts that run *outside* the image (deploy/),
+#   * local cargo build artefacts that would invalidate cache mounts
+#     and balloon the build context (src-rust/target/),
+#   * Git internals (.git/),
+#   * editor/IDE droppings.
+#
+# Excluding them here speeds up `docker build` (less to upload to the
+# daemon) and prevents cache-busting from unrelated file changes.
+
+# --- VCS ---
+.git
+.gitignore
+.gitattributes
+
+# --- Editor / IDE ---
+.vscode
+.idea
+*.swp
+*.swo
+*.iml
+
+# --- OS droppings ---
+.DS_Store
+Thumbs.db
+
+# --- Rust build artefacts ---
+# `target/` is enormous and would invalidate the cargo build cache
+# inside the image on every `docker build`. The cache mounts in the
+# Dockerfile recreate cargo's cache on demand.
+src-rust/target
+**/target
+**/*.rs.bk
+
+# --- Spec / reference content not needed at runtime ---
+spec
+public
+test
+
+# --- Deployment scripts (run on the operator's machine, not in image) ---
+deploy
+
+# --- Local CLI / dev configuration (host-only, not for the image) ---
+# `.claude/` carries `settings.json` + `settings.local.json` that pin the
+# local CLI at DeepSeek's endpoint with a host-side API key — never ship.
+# `litellm.yaml` is the LiteLLM proxy config used for local dev only.
+# `CLAUDE.md` is repo orientation prose for humans, not runtime data.
+.claude
+litellm.yaml
+CLAUDE.md
+README.md
+*.md
+
+# --- Misc local-only files ---
+*.log
+*.tmp
+.env
+.env.*
+node_modules
+
+# --- Existing Dockerfile / dockerignore (no need to ship) ---
+Dockerfile
+.dockerignore
