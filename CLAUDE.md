@@ -72,7 +72,7 @@ $acr = 'mapagentacr'
 
 ./deploy/build-image.ps1   -AcrName $acr -ImageVersion $tag
 ./deploy/push-image.ps1    -AcrName $acr -ImageVersion $tag
-./deploy/provision-app.ps1 -AcrName $acr -ImageTag $tag
+./deploy/provision-app.ps1 -AcrName $acr -ImageTag $tag -UseAdminCreds
 ```
 
 Same `$tag` threads through all three. `build` and `push` use `-ImageVersion` (must match `^v\d+\.\d+\.\d+$`); `provision-app` uses `-ImageTag` (any tag, but matching the version is what makes the deploy reproducible).

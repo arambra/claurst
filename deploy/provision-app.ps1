@@ -68,6 +68,19 @@
 #                            -ResourceGroup (default: -ResourceGroup).
 #   -EnvResourceGroup        Group containing the Container Apps environment if
 #                            separate from -ResourceGroup (default: -ResourceGroup).
+#   -UseAdminCreds           Bind ACR pulls via admin username/password instead
+#                            of the UAMI. Required when the deployer lacks
+#                            Microsoft.Authorization/roleAssignments/write and
+#                            therefore cannot grant the UAMI AcrPull on the
+#                            registry (provision-identity.ps1 fails). The ACR
+#                            must have `adminUserEnabled = true` (acr.bicep
+#                            default) and the caller needs read access to the
+#                            registry's admin credentials (Contributor /
+#                            AcrPush / Owner). The password is stored as a
+#                            Container Apps secret managed by the platform.
+#                            The UAMI is still attached to the app (so workloads
+#                            keep their app-level identity) — only the *image
+#                            pull* path changes from UAMI → admin creds.
 #
 # Example:
 #   ./deploy/provision-app.ps1 -ImageTag v0.1.0
@@ -112,7 +125,13 @@ param(
 
     [string] $AcrResourceGroup      = '',
     [string] $IdentityResourceGroup = '',
-    [string] $EnvResourceGroup      = ''
+    [string] $EnvResourceGroup      = '',
+
+    # Switch to bind ACR pulls via admin username/password instead of the UAMI.
+    # See header doc for the "deployer lacks RBAC write" use case this exists
+    # for. When set, the script reads admin creds via `az acr credential show`
+    # and binds them via `--registry-username` / `--registry-password`.
+    [switch] $UseAdminCreds
 )
 
 $ErrorActionPreference = 'Stop'
@@ -144,6 +163,8 @@ $subscriptionId   = az account show --query id   --output tsv
 
 $imageRef = "$AcrName.azurecr.io/$ImageName`:$ImageTag"
 
+$registryAuthMode = if ($UseAdminCreds) { 'admin credentials (-UseAdminCreds)' } else { 'user-assigned managed identity' }
+
 Write-Host ">> Active subscription: $subscriptionName ($subscriptionId)"
 Write-Host ">> Container App:       $ContainerAppName (group: $ResourceGroup)"
 Write-Host ">> Environment:         $ContainerAppsEnv (group: $EnvResourceGroup)"
@@ -151,6 +172,7 @@ Write-Host ">> Registry:            $AcrName (group: $AcrResourceGroup)"
 Write-Host ">> Identity (UAMI):     $IdentityName (group: $IdentityResourceGroup)"
 Write-Host ">> Image:               $imageRef"
 Write-Host ">> Target port:         $TargetPort"
+Write-Host ">> Registry auth:       $registryAuthMode"
 
 Write-Host ">> Ensuring 'containerapp' Azure CLI extension is installed..."
 $installed = az extension list --query "[?name=='containerapp'].name | [0]" -o tsv 2>$null
@@ -215,6 +237,38 @@ if ([string]::IsNullOrWhiteSpace($acrLoginServer)) {
 $imageRef = "$acrLoginServer/$ImageName`:$ImageTag"
 
 # -----------------------------------------------------------------------------
+# Step 2b (optional): resolve ACR admin credentials when -UseAdminCreds is set
+# -----------------------------------------------------------------------------
+
+# When the deployer lacks Microsoft.Authorization/roleAssignments/write they
+# cannot grant the UAMI AcrPull on the registry. Without that grant, Container
+# Apps' image-pull validation fails with:
+#   "unable to pull image using Managed identity ... for registry <acr>"
+# Falling back to the registry's built-in admin user is the documented escape
+# hatch (see deploy/ACR-AUTH.md "Runtime pull vs CI push") — Container Apps
+# stores the password as a managed secret and uses it for every pull.
+$acrAdminUser = $null
+$acrAdminPwd  = $null
+if ($UseAdminCreds) {
+    Write-Host ">> Resolving ACR admin credentials (UAMI bypass — caller lacks RBAC to grant AcrPull)..."
+    $acrAdminUser = az acr credential show `
+        --name $AcrName `
+        --resource-group $AcrResourceGroup `
+        --query username `
+        --output tsv 2>$null
+    $acrAdminPwd = az acr credential show `
+        --name $AcrName `
+        --resource-group $AcrResourceGroup `
+        --query "passwords[0].value" `
+        --output tsv 2>$null
+
+    if ([string]::IsNullOrWhiteSpace($acrAdminUser) -or
+        [string]::IsNullOrWhiteSpace($acrAdminPwd)) {
+        throw "Could not read ACR admin credentials for '$AcrName'. Confirm 'adminUserEnabled = true' on the registry (deploy/acr.bicep default) and that the active principal has Contributor / AcrPush / Owner on the registry (required for Microsoft.ContainerRegistry/registries/listCredentials/action)."
+    }
+}
+
+# -----------------------------------------------------------------------------
 # Step 3: confirm the Container Apps environment exists
 # -----------------------------------------------------------------------------
 
@@ -252,14 +306,24 @@ if ([string]::IsNullOrWhiteSpace($existingAppId)) {
     #   --environment <id>            : pin to the env resolved in Step 3.
     #   --image <ref>                 : ACR-hosted runtime image.
     #   --user-assigned <UAMI id>     : attach the UAMI so the running container
-    #                                   inherits the identity.
+    #                                   inherits the identity (used for app-level
+    #                                   auth even when the registry pull path
+    #                                   uses admin creds).
     #   --registry-server <login>     : tell Container Apps which registry to
-    #                                   pull from. Required alongside
-    #                                   --registry-identity.
-    #   --registry-identity <UAMI id> : authenticate ACR pulls via the UAMI's
-    #                                   AcrPull grant (provision-identity.ps1
-    #                                   created this), eliminating the ACR
-    #                                   admin password from Container Apps secrets.
+    #                                   pull from. Required alongside either
+    #                                   --registry-identity or
+    #                                   --registry-username/--registry-password.
+    #   --registry-identity <UAMI id> : (default path) authenticate ACR pulls via
+    #                                   the UAMI's AcrPull grant
+    #                                   (provision-identity.ps1 created this),
+    #                                   eliminating the ACR admin password from
+    #                                   Container Apps secrets.
+    #   --registry-username/-password : (-UseAdminCreds path) authenticate ACR
+    #                                   pulls with the registry's admin user.
+    #                                   Container Apps stores the password as a
+    #                                   managed secret. Used when the deployer
+    #                                   lacks roleAssignments/write to grant the
+    #                                   UAMI AcrPull.
     #   --ingress external            : public HTTPS endpoint via the managed
     #                                   reverse proxy.
     #   --target-port <port>          : the port `claude serve` binds to inside
@@ -270,25 +334,66 @@ if ([string]::IsNullOrWhiteSpace($existingAppId)) {
     #   --max-replicas 1              : single replica, no auto-scale (Seed:
     #                                   "single Azure Container Apps instance").
     #   --revisions-mode single       : only one active revision at a time.
-    az containerapp create `
-        --name $ContainerAppName `
-        --resource-group $ResourceGroup `
-        --environment $envResourceId `
-        --image $imageRef `
-        --user-assigned $identityResourceId `
-        --registry-server $acrLoginServer `
-        --registry-identity $identityResourceId `
-        --ingress external `
-        --target-port $TargetPort `
-        --transport auto `
-        --min-replicas 1 `
-        --max-replicas 1 `
-        --revisions-mode single `
-        --output none
+    if ($UseAdminCreds) {
+        az containerapp create `
+            --name $ContainerAppName `
+            --resource-group $ResourceGroup `
+            --environment $envResourceId `
+            --image $imageRef `
+            --user-assigned $identityResourceId `
+            --registry-server $acrLoginServer `
+            --registry-username $acrAdminUser `
+            --registry-password $acrAdminPwd `
+            --ingress external `
+            --target-port $TargetPort `
+            --transport auto `
+            --min-replicas 1 `
+            --max-replicas 1 `
+            --revisions-mode single `
+            --output none
+    }
+    else {
+        az containerapp create `
+            --name $ContainerAppName `
+            --resource-group $ResourceGroup `
+            --environment $envResourceId `
+            --image $imageRef `
+            --user-assigned $identityResourceId `
+            --registry-server $acrLoginServer `
+            --registry-identity $identityResourceId `
+            --ingress external `
+            --target-port $TargetPort `
+            --transport auto `
+            --min-replicas 1 `
+            --max-replicas 1 `
+            --revisions-mode single `
+            --output none
+    }
     if ($LASTEXITCODE -ne 0) { throw "az containerapp create failed (exit $LASTEXITCODE)" }
 }
 else {
     Write-Host ">> Container App '$ContainerAppName' already exists — updating image and replica config..."
+
+    # When -UseAdminCreds is set we MUST rebind the registry to admin creds
+    # *before* the image update. Reason: `az containerapp update --image`
+    # provisions a new revision, which the platform validates by pulling the
+    # image with whatever auth the current registry binding declares. If the
+    # current binding is UAMI-based and the UAMI lacks AcrPull (the exact
+    # scenario this switch exists for), the pull fails and the update aborts
+    # before the binding can be changed. Reordering — bind first, then update
+    # — gives the new revision a working pull path on its first try.
+    if ($UseAdminCreds) {
+        Write-Host ">> Rebinding registry to admin credentials (pre-image-swap)..."
+        az containerapp registry set `
+            --name $ContainerAppName `
+            --resource-group $ResourceGroup `
+            --server $acrLoginServer `
+            --username $acrAdminUser `
+            --password $acrAdminPwd `
+            --output none
+        if ($LASTEXITCODE -ne 0) { throw "az containerapp registry set (admin creds) failed (exit $LASTEXITCODE)" }
+    }
+
     # Update path: don't repeat `--environment` (immutable) or `--ingress`
     # (its own subcommand). `--revisions-mode` is also create-only — it is
     # asserted via `az containerapp revision set-mode` below. The three flags
@@ -339,30 +444,36 @@ else {
         Write-Warning "az containerapp identity assign exited $LASTEXITCODE — continuing (image swap already succeeded)."
     }
 
-    # Skip the UAMI rebind if the current registry binding uses admin/token creds
-    # (username set, identity empty). Forcing a flip back to UAMI auth when the
-    # UAMI lacks AcrPull on the registry causes a 15-25 min platform-side retry
-    # hang — the new binding can't be validated, so the operation never reaches
-    # a terminal state quickly. Leaving the working creds-based binding alone
-    # keeps deploys idempotent until UAMI is granted AcrPull (then this branch
-    # naturally flips back via the create path or a manual rebind).
-    $currentRegUser = az containerapp show `
-        --name $ContainerAppName `
-        --resource-group $ResourceGroup `
-        --query "properties.configuration.registries[?server=='$acrLoginServer'].username | [0]" `
-        --output tsv 2>$null
-    if (-not [string]::IsNullOrWhiteSpace($currentRegUser)) {
-        Write-Host ">> Registry already bound via admin/token creds (username='$currentRegUser') — skipping UAMI rebind."
+    # Skip the UAMI rebind if -UseAdminCreds is set (the registry was just bound
+    # to admin creds above — don't immediately flip it back) or if the current
+    # registry binding already uses admin/token creds (username set, identity
+    # empty). Forcing a flip back to UAMI auth when the UAMI lacks AcrPull on
+    # the registry causes a 15-25 min platform-side retry hang — the new binding
+    # can't be validated, so the operation never reaches a terminal state
+    # quickly. Leaving the working creds-based binding alone keeps deploys
+    # idempotent until UAMI is granted AcrPull (then this branch naturally flips
+    # back via the create path or a manual rebind).
+    if ($UseAdminCreds) {
+        Write-Host ">> Registry bound via admin credentials (-UseAdminCreds); skipping UAMI rebind."
     } else {
-        Write-Host ">> Ensuring ACR pulls authenticate via the UAMI..."
-        az containerapp registry set `
+        $currentRegUser = az containerapp show `
             --name $ContainerAppName `
             --resource-group $ResourceGroup `
-            --server $acrLoginServer `
-            --identity $identityResourceId `
-            --output none
-        if ($LASTEXITCODE -ne 0) {
-            Write-Warning "az containerapp registry set exited $LASTEXITCODE — continuing. Likely cause: the app currently pulls from ACR via admin username/password rather than UAMI; this is harmless if pulls keep succeeding. Re-create the app via the create path to migrate to UAMI auth."
+            --query "properties.configuration.registries[?server=='$acrLoginServer'].username | [0]" `
+            --output tsv 2>$null
+        if (-not [string]::IsNullOrWhiteSpace($currentRegUser)) {
+            Write-Host ">> Registry already bound via admin/token creds (username='$currentRegUser') — skipping UAMI rebind."
+        } else {
+            Write-Host ">> Ensuring ACR pulls authenticate via the UAMI..."
+            az containerapp registry set `
+                --name $ContainerAppName `
+                --resource-group $ResourceGroup `
+                --server $acrLoginServer `
+                --identity $identityResourceId `
+                --output none
+            if ($LASTEXITCODE -ne 0) {
+                Write-Warning "az containerapp registry set exited $LASTEXITCODE — continuing. Likely cause: the app currently pulls from ACR via admin username/password rather than UAMI; this is harmless if pulls keep succeeding. Re-create the app via the create path to migrate to UAMI auth."
+            }
         }
     }
 }
