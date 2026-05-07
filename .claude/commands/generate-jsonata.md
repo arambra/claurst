@@ -19,17 +19,58 @@ The user has two JSON files (an input and a desired output) and wants a single J
 2. Build a mapping table mentally: for every leaf value in the target output, identify whether it (a) comes verbatim from a path in the input, (b) is a transformation (concat, math, type cast, lookup), or (c) is a constant.
 3. Walk the target output **top-down**. For each object, write a JSONata `{ ... }` block whose keys appear in the same textual order as the target. For each array, write a `$map` / `[...]` that preserves index order (or apply explicit ordering when needed).
 4. Write the expression to a `.jsonata` file using the `Write` tool. Path: third argument if provided, else `<dirname-of-output>/<basename-of-output-without-.json>.jsonata`.
-5. **Verify the output.** Run the expression against the input and diff against the target:
+5. **Verify with a key-order-aware comparison.** Run the expression against the input, then diff the canonicalized result against the target. Value-only structural diffs (e.g. `Compare-Object` on parsed objects, `jq -e '. == .'`) silently miss key reorderings and **must not be used** — they would let a regression on Hard Requirement #1 pass undetected.
+
+   Two pitfalls to avoid:
+   - `npx -y jsonata-cli "<expr>"` passes the whole expression as a CLI argument, which blows past the Windows `cmd.exe` 8 KB limit for non-trivial expressions. Use a Node helper that reads the `.jsonata` file from disk instead (see below).
+   - PowerShell's `-eq`/`-ceq` operators on multi-line strings act as **filters**, not boolean comparators, when stdout is captured as an array of lines. Compare canonicalized files via hash or via `git diff --no-index` for an unambiguous boolean.
 
    ```powershell
-   # If jsonata-cli is on PATH:
-   jsonata -e (Get-Content <generated>.jsonata -Raw) (Get-Content <input>.json -Raw) > <tmp>.json
-   # Or via npx (no install required):
-   npx -y jsonata-cli "$(Get-Content <generated>.jsonata -Raw)" --input <input>.json > <tmp>.json
+   # 1. Make sure the jsonata package is available to Node (one-time per repo).
+   #    Cheapest way: install once locally; on a fresh checkout `npm install`
+   #    will pull it from package.json if you save it as a devDependency.
+   if (-not (Test-Path node_modules/jsonata)) { npm install --no-save jsonata }
+
+   # 2. Evaluate the expression via a small ESM helper that reads the .jsonata
+   #    from disk (bypasses the Windows command-line length limit). Write the
+   #    helper once, reuse forever:
+   #
+   #       // tools/run-jsonata.mjs
+   #       import { readFileSync } from 'node:fs';
+   #       import jsonata from 'jsonata';
+   #       const [exprPath, inputPath] = process.argv.slice(2);
+   #       const expr  = readFileSync(exprPath, 'utf8');
+   #       const input = JSON.parse(readFileSync(inputPath, 'utf8'));
+   #       const result = await jsonata(expr).evaluate(input);
+   #       process.stdout.write(JSON.stringify(result, null, 2));
+   #
+   node tools/run-jsonata.mjs <generated>.jsonata <input>.json > <generated>.json
+
+   # 3. Canonicalize both target and generated. Node's JSON.parse + JSON.stringify
+   #    preserves the insertion order of object keys (ECMAScript spec — string
+   #    keys are enumerated in insertion order), so any key-order divergence at
+   #    any nesting depth shows up as a textual difference.
+   $canon = {
+       param($p)
+       node -e "process.stdout.write(JSON.stringify(JSON.parse(require('fs').readFileSync(process.argv[1],'utf8')), null, 2))" "$p"
+   }
+   & $canon <output>.json    | Out-File _expected.canon.json -Encoding utf8 -NoNewline
+   & $canon <generated>.json | Out-File _generated.canon.json -Encoding utf8 -NoNewline
+
+   # 4. Hash compare — unambiguous boolean, no PowerShell array-vs-string traps.
+   $expHash = (Get-FileHash _expected.canon.json -Algorithm SHA256).Hash
+   $genHash = (Get-FileHash _generated.canon.json -Algorithm SHA256).Hash
+   if ($expHash -eq $genHash) {
+       Write-Host "verified: key order and values match"
+       Remove-Item _expected.canon.json, _generated.canon.json
+   } else {
+       Write-Host "MISMATCH — first divergent lines:"
+       git --no-pager diff --no-index --no-color _expected.canon.json _generated.canon.json
+   }
    ```
 
-   Compare with `<output>.json`. If `jsonata-cli` is not available, ask the user to install it (`npm i -g jsonata-cli`) — do not skip verification silently.
-6. If the diff is non-empty: identify the first divergent path, fix the JSONata for that path only, and re-verify. Repeat until the diff is empty.
+   If `node` or the `jsonata` npm package isn't available, ask the user to install (Node 18+ and `npm install jsonata`) — do not skip verification silently. The standalone `jsonata-cli` binary works for tiny expressions but is not safe on Windows past ~8 KB; prefer the Node-helper path universally.
+6. If the canonicalized diff is non-empty: identify the first divergent line, trace it back to its JSONata source (key reorder in step 3, value transform, missing/extra key), fix that one location in the `.jsonata` file, and re-run step 5. Repeat until `$expected -ceq $generated` holds.
 7. Report: the path of the written `.jsonata` file, whether verification passed, and the verification command you ran. If verification was skipped (e.g. tool unavailable), say so explicitly.
 
 ## Common pitfalls — check these before claiming success

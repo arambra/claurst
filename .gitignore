@@ -21,6 +21,10 @@ src-rust/target
 # test files
 test/*
 
+# Node modules from `npm install` (e.g. `jsonata` for the generate-jsonata
+# slash command's verification step). Reinstall on demand; do not commit.
+node_modules/
+
 # Local-only Claude Code state (per-user permission allowlist + runtime locks).
 # settings.json (shared config) stays tracked; *.local.json and lock files don't.
 .claude/settings.local.json
